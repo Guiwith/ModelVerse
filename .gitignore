@@ -1,0 +1,12 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+venv/
+node_modules/
+.vscode/
+.env
+.models/
+.datasets
