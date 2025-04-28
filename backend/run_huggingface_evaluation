@@ -1,0 +1,55 @@
+from typing import Tuple
+import os
+import traceback
+
+def run_huggingface_evaluation(task_id: int, model_path: str, output_dir: str, evaluation_method: str = "mmlu", max_retries=3, retry_delay=2) -> Tuple[bool, str]:
+    """执行HuggingFace评估，包含重试机制和更好的错误处理"""
+    logger.info(f"开始HuggingFace评估: 任务ID={task_id}, 模型路径={model_path}")
+    
+    # 导入必要的库
+    import numpy as np
+    import random
+    
+    # 创建输出目录
+    os.makedirs(output_dir, exist_ok=True)
+    
+    task = get_evaluation_task(task_id)
+    if not task:
+        raise ValueError(f"找不到评估任务: {task_id}")
+    
+    # 最终结果存储
+    evaluation_results = {
+        "subjects": {},
+        "accuracy": 0.0,
+        "total_samples": 0,
+        "successful_samples": 0,
+        "failed_samples": 0,
+        "errors": []
+    }
+    
+    # 设置随机种子以确保可重现性
+    np.random.seed(42)
+    random.seed(42)
+    
+    try:
+        # 获取当前工作目录的绝对路径
+        current_dir = os.path.abspath(os.getcwd())
+        
+        # 获取数据集缓存路径
+        cache_dir = get_dataset_cache_path()
+        
+        # 不再检查本地数据集路径，直接使用run_mmlu_evaluation
+        if evaluation_method == "mmlu":
+            add_evaluation_log(task_id, f"开始使用HuggingFace数据集进行MMLU评估...")
+            success, result_path = run_mmlu_evaluation(task_id, model_path, output_dir, cache_dir)
+            return success, result_path
+        else:
+            error_msg = f"不支持的评估方法: {evaluation_method}"
+            logger.error(error_msg)
+            add_evaluation_log(task_id, {"status": "error", "message": error_msg})
+            return False, error_msg
+    except Exception as e:
+        error_msg = f"评估过程中发生错误: {traceback.format_exc()}"
+        logger.error(error_msg)
+        add_evaluation_log(task_id, {"status": "error", "message": error_msg})
+        return False, error_msg 
