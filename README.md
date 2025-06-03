@@ -4,11 +4,11 @@
 
 ModelVerse是一个功能强大的大语言模型(LLM)一体化推训平台，致力于为AI开发者和研究者提供完整的模型生命周期管理解决方案。从模型管理到推理部署，从训练微调到性能评估，ModelVerse将复杂的AI工作流程简化为直观易用的一体化平台。
 
-![](assets\1.png)
+![1](assets\1.png)
 
-![](assets\2.png)
+![2](assets\2.png)
 
-![](assets\3.png)
+![3](assets\3.png)
 
 ## ✨ 核心功能
 
