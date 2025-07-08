@@ -183,7 +183,7 @@ const resources = {
   
   // 取消下载
   cancelDownload(id) {
-    return apiClient.post(`/resources/${id}/cancel`)
+    return apiClient.post(`/resources/${id}/stop`)
   },
   
   // 重试下载

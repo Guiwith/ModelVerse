@@ -9,4 +9,6 @@ Pillow
 huggingface_hub>=0.17.0 
 websocket
 oumi[gpu]
-PyYAML==6.0
+PyYAML
+hf_transfer
+hf_xet

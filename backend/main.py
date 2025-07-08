@@ -1104,23 +1104,18 @@ async def create_inference_task_api(
             raise HTTPException(status_code=400, detail="模型未下载完成")
         
         # 检查GPU资源是否足够
-        gpu_info = inference_utils.get_gpu_info()
-        if not gpu_info["available"]:
-            logger.error("没有可用的GPU")
-            raise HTTPException(status_code=400, detail="没有可用的GPU")
-        
-        # 估算模型显存占用
-        estimated_memory = inference_utils.estimate_model_memory(
+        resource_check = inference_utils.check_gpu_resources_for_task(
             model_id=task_create.model_id,
-            tensor_parallel_size=task_create.tensor_parallel_size
+            tensor_parallel_size=task_create.tensor_parallel_size,
+            max_model_len=task_create.max_model_len,
+            quantization=task_create.quantization
         )
         
-        # 检查显存是否足够
-        if estimated_memory > gpu_info["free_memory"]:
-            logger.error(f"GPU显存不足: 需要 {estimated_memory:.2f}GB, 可用 {gpu_info['free_memory']:.2f}GB")
+        if not resource_check["sufficient"]:
+            logger.error(f"GPU资源检查失败: {resource_check['reason']}")
             raise HTTPException(
                 status_code=400,
-                detail=f"GPU显存不足: 需要 {estimated_memory:.2f}GB, 可用 {gpu_info['free_memory']:.2f}GB"
+                detail=resource_check["reason"]
             )
         
         # 创建推理任务
@@ -1288,23 +1283,18 @@ async def start_inference_task(
             raise HTTPException(status_code=400, detail="推理任务已在运行中")
         
         # 检查GPU资源是否足够
-        gpu_info = inference_utils.get_gpu_info()
-        if not gpu_info["available"]:
-            logger.error("没有可用的GPU")
-            raise HTTPException(status_code=400, detail="没有可用的GPU")
-        
-        # 估算模型显存占用
-        estimated_memory = inference_utils.estimate_model_memory(
+        resource_check = inference_utils.check_gpu_resources_for_task(
             model_id=task.model_id,
-            tensor_parallel_size=task.tensor_parallel_size
+            tensor_parallel_size=task.tensor_parallel_size,
+            max_model_len=task.max_model_len,
+            quantization=task.quantization
         )
         
-        # 检查显存是否足够
-        if estimated_memory > gpu_info["free_memory"]:
-            logger.error(f"GPU显存不足: 需要 {estimated_memory:.2f}GB, 可用 {gpu_info['free_memory']:.2f}GB")
+        if not resource_check["sufficient"]:
+            logger.error(f"GPU资源检查失败: {resource_check['reason']}")
             raise HTTPException(
                 status_code=400,
-                detail=f"GPU显存不足: 需要 {estimated_memory:.2f}GB, 可用 {gpu_info['free_memory']:.2f}GB"
+                detail=resource_check["reason"]
             )
         
         # 更新任务状态
@@ -1360,6 +1350,29 @@ async def get_gpu_status(current_user: User = Depends(get_current_active_user)):
     except Exception as e:
         logger.exception(f"获取GPU状态失败: {str(e)}")
         raise HTTPException(status_code=500, detail=f"获取GPU状态失败: {str(e)}")
+
+@app.get("/api/inference/gpu/detailed", response_model=dict)
+async def get_detailed_gpu_status(current_user: User = Depends(get_current_active_user)):
+    """获取详细的GPU状态信息，包括实时监控数据"""
+    try:
+        # 获取实时GPU信息
+        real_gpu_info = inference_utils.get_real_gpu_info()
+        gpu_info = inference_utils.get_gpu_info()
+        
+        return {
+            "nvidia_smi_available": real_gpu_info["available"],
+            "real_time_data": real_gpu_info,
+            "system_data": gpu_info,
+            "recommendations": {
+                "can_start_new_task": gpu_info.get("free_memory", 0) > 8.0,
+                "optimal_concurrent_tasks": gpu_info.get("max_concurrent_tasks", 0),
+                "memory_usage_percentage": (gpu_info.get("used_memory", 0) / gpu_info.get("total_memory", 1)) * 100 if gpu_info.get("total_memory", 0) > 0 else 0,
+                "safety_status": "safe" if (gpu_info.get("used_memory", 0) / gpu_info.get("total_memory", 1)) < 0.8 else "warning" if (gpu_info.get("used_memory", 0) / gpu_info.get("total_memory", 1)) < 0.95 else "critical"
+            }
+        }
+    except Exception as e:
+        logger.exception(f"获取详细GPU信息失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"获取详细GPU信息失败: {str(e)}")
 
 @app.post("/api/inference/tasks/{task_id}/chat", response_model=ChatResponse)
 async def inference_chat(

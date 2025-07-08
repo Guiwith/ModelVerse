@@ -49,25 +49,24 @@ def get_model_path(model_id: int) -> Optional[str]:
     return model.local_path
 
 # 获取模型的显存占用估计（GB）
-def estimate_model_memory(model_id: int, tensor_parallel_size: int = 1) -> float:
-    """估计模型的显存占用（GB）"""
+def estimate_model_memory(model_id: int, tensor_parallel_size: int = 1, max_model_len: int = 4096, quantization: Optional[str] = None) -> float:
+    """估计模型的显存占用（GB）- 改进版本，考虑KV cache等额外开销"""
     model = get_resource(resource_id=model_id)
     if not model:
         return 0.0
-    
-    # 简单估算：根据模型名称或大小粗略估计
-    # 实际占用取决于模型架构、量化和并行度
     
     # 从模型名称中提取参数规模（如果可能）
     model_name = model.name.lower()
     model_size = 0
     
-    # 检查常见的命名模式
-    for scale in ["7b", "13b", "70b", "1.8b", "3b", "2.7b"]:
+    # 检查常见的命名模式（扩展更多规模）
+    for scale in ["135m", "1.8b", "2.7b", "3b", "7b", "8b", "13b", "14b", "30b", "34b", "70b", "72b", "405b"]:
         if scale in model_name:
-            size_str = scale.replace("b", "")
+            size_str = scale.replace("b", "").replace("m", "")
             try:
-                if "." in size_str:
+                if "m" in scale:  # 百万参数
+                    model_size = float(size_str) / 1000  # 转换为B
+                elif "." in size_str:
                     model_size = float(size_str)
                 else:
                     model_size = int(size_str)
@@ -75,39 +74,173 @@ def estimate_model_memory(model_id: int, tensor_parallel_size: int = 1) -> float
                 pass
             break
     
-    # 默认估算
-    if model_size == 0:
-        # 基于文件大小粗略估计
-        if model.size_mb:
-            model_size = model.size_mb / 1024  # 转换为GB
+    # 如果无法从名称提取，尝试基于文件大小估算
+    if model_size == 0 and model.size_mb:
+        # 粗略估算：模型文件大小（MB）/ 1024 约等于参数规模（B）
+        # 这个比例会根据精度（fp16/fp32）和量化而变化
+        model_size = model.size_mb / 1024  # 转换为GB，作为参数规模的粗略估计
     
-    # 根据参数规模估算显存占用（粗略估计）
-    if model_size <= 2:
-        memory = 8.0  # ~2B 模型大约需要 8GB
-    elif model_size <= 7:
-        memory = 16.0  # ~7B 模型大约需要 16GB
-    elif model_size <= 13:
-        memory = 28.0  # ~13B 模型大约需要 28GB
-    elif model_size <= 30:
-        memory = 48.0  # ~30B 模型大约需要 48GB
-    elif model_size <= 70:
-        memory = 80.0  # ~70B 模型大约需要 80GB
+    # 基础模型权重显存占用（考虑精度）
+    if model_size <= 0.2:  # ~135M-200M
+        base_memory = 2.0
+    elif model_size <= 2:  # ~1.8B-2B
+        base_memory = 4.0  
+    elif model_size <= 3:  # ~2.7B-3B
+        base_memory = 6.0
+    elif model_size <= 7:  # ~7B
+        base_memory = 14.0
+    elif model_size <= 8:  # ~8B
+        base_memory = 16.0
+    elif model_size <= 13:  # ~13B
+        base_memory = 26.0
+    elif model_size <= 14:  # ~14B
+        base_memory = 28.0
+    elif model_size <= 30:  # ~30B
+        base_memory = 60.0
+    elif model_size <= 34:  # ~34B
+        base_memory = 68.0
+    elif model_size <= 70:  # ~70B
+        base_memory = 140.0
+    elif model_size <= 405:  # ~405B
+        base_memory = 800.0
     else:
-        memory = 16.0  # 默认值
+        base_memory = max(8.0, model_size * 2)  # 默认估算公式
     
-    # 考虑量化的影响（大约减少一半显存）
-    if "quantization" in model_name or "int8" in model_name or "int4" in model_name:
-        memory *= 0.5
+    # 考虑量化的影响
+    if quantization:
+        if quantization.lower() in ["awq", "gptq"]:
+            base_memory *= 0.5  # 4-bit量化大约减少50%
+        elif quantization.lower() in ["int8"]:
+            base_memory *= 0.75  # 8-bit量化大约减少25%
+    elif "quantization" in model_name or "int8" in model_name or "int4" in model_name or "awq" in model_name or "gptq" in model_name:
+        base_memory *= 0.5
     
-    # 根据并行度调整
+    # KV Cache 显存占用估算
+    # KV cache 大小 ≈ 2 * num_layers * hidden_size * max_seq_len * batch_size * precision_bytes
+    # 对于Transformer模型，粗略估算：
+    kv_cache_factor = max_model_len / 2048  # 相对于2048基准长度的倍数
+    if model_size <= 2:
+        kv_cache_memory = 1.0 * kv_cache_factor
+    elif model_size <= 7:
+        kv_cache_memory = 2.0 * kv_cache_factor
+    elif model_size <= 13:
+        kv_cache_memory = 3.0 * kv_cache_factor
+    elif model_size <= 30:
+        kv_cache_memory = 6.0 * kv_cache_factor
+    elif model_size <= 70:
+        kv_cache_memory = 12.0 * kv_cache_factor
+    else:
+        kv_cache_memory = 20.0 * kv_cache_factor
+    
+    # vLLM 系统开销（缓冲区、内存池等）
+    system_overhead = max(2.0, base_memory * 0.2)  # 至少2GB，或基础内存的20%
+    
+    # 总显存需求
+    total_memory = base_memory + kv_cache_memory + system_overhead
+    
+    # 根据并行度调整（模型权重会分片，但KV cache和系统开销基本不变）
     if tensor_parallel_size > 1:
-        memory = memory / tensor_parallel_size
+        total_memory = (base_memory / tensor_parallel_size) + kv_cache_memory + system_overhead
     
-    return memory
+    logger.info(f"显存估算详情 - 模型: {model_name}, 参数规模: {model_size}B, "
+                f"基础内存: {base_memory:.1f}GB, KV Cache: {kv_cache_memory:.1f}GB, "
+                f"系统开销: {system_overhead:.1f}GB, 总计: {total_memory:.1f}GB")
+    
+    return total_memory
 
-# 获取系统GPU信息
+# 使用nvidia-smi获取实时GPU信息
+def get_real_gpu_info() -> Dict[str, Any]:
+    """使用nvidia-smi获取实时GPU信息"""
+    try:
+        # 查询GPU信息：名称、总显存、已用显存、空闲显存、GPU利用率、温度
+        cmd = [
+            'nvidia-smi', 
+            '--query-gpu=gpu_name,memory.total,memory.used,memory.free,utilization.gpu,temperature.gpu',
+            '--format=csv,noheader,nounits'
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        
+        if result.returncode != 0:
+            logger.error(f"nvidia-smi执行失败: {result.stderr}")
+            return {"available": False, "error": "nvidia-smi执行失败", "gpus": []}
+        
+        lines = result.stdout.strip().split('\n')
+        gpus = []
+        total_memory = 0
+        total_used = 0
+        
+        for i, line in enumerate(lines):
+            if line.strip():
+                parts = [p.strip() for p in line.split(',')]
+                if len(parts) >= 6:
+                    gpu_name = parts[0]
+                    memory_total = float(parts[1]) / 1024  # 转换为GB
+                    memory_used = float(parts[2]) / 1024   # 转换为GB
+                    memory_free = float(parts[3]) / 1024   # 转换为GB
+                    gpu_util = parts[4]
+                    temperature = parts[5]
+                    
+                    total_memory += memory_total
+                    total_used += memory_used
+                    
+                    gpus.append({
+                        "id": i,
+                        "name": gpu_name,
+                        "memory_total": memory_total,
+                        "memory_used": memory_used,
+                        "memory_free": memory_free,
+                        "utilization": f"{gpu_util}%",
+                        "temperature": f"{temperature}°C"
+                    })
+        
+        return {
+            "available": True,
+            "gpus": gpus,
+            "total_memory": total_memory,
+            "used_memory": total_used,
+            "free_memory": total_memory - total_used
+        }
+        
+    except subprocess.TimeoutExpired:
+        logger.error("nvidia-smi查询超时")
+        return {"available": False, "error": "nvidia-smi查询超时", "gpus": []}
+    except FileNotFoundError:
+        logger.error("nvidia-smi命令未找到，可能未安装NVIDIA驱动")
+        return {"available": False, "error": "nvidia-smi未找到", "gpus": []}
+    except Exception as e:
+        logger.error(f"获取GPU信息失败: {str(e)}")
+        return {"available": False, "error": str(e), "gpus": []}
+
+# 获取系统GPU信息（改进版本）
 def get_gpu_info() -> Dict[str, Any]:
-    """获取系统GPU信息"""
+    """获取系统GPU信息 - 优先使用nvidia-smi实时查询"""
+    # 首先尝试使用nvidia-smi获取实时信息
+    real_gpu_info = get_real_gpu_info()
+    
+    if real_gpu_info["available"]:
+        # 添加任务信息到实时GPU信息中
+        for gpu in real_gpu_info["gpus"]:
+            # 计算该GPU上运行的任务
+            tasks_on_gpu = [p for p in active_processes if p.get("gpu_device") == gpu["id"]]
+            gpu["running_tasks"] = len(tasks_on_gpu)
+            gpu["task_details"] = [
+                {
+                    "task_id": p["task_id"],
+                    "estimated_memory": p.get("gpu_memory", 0),
+                    "command": p["command"][:100] + "..." if len(p["command"]) > 100 else p["command"]
+                }
+                for p in tasks_on_gpu
+            ]
+        
+        # 计算建议的最大并发任务数（基于实际空闲显存）
+        min_task_memory = 8.0  # 假设最小任务需要8GB
+        max_concurrent_tasks = max(1, int(real_gpu_info["free_memory"] / min_task_memory))
+        real_gpu_info["max_concurrent_tasks"] = max_concurrent_tasks
+        
+        return real_gpu_info
+    
+    # 如果nvidia-smi不可用，回退到torch方法
     try:
         if not torch.cuda.is_available():
             return {"available": False, "gpus": [], "total_memory": 0, "used_memory": 0, "free_memory": 0}
@@ -121,18 +254,26 @@ def get_gpu_info() -> Dict[str, Any]:
             gpu_memory = torch.cuda.get_device_properties(i).total_memory / (1024 ** 3)  # GB
             total_memory += gpu_memory
             
-            # 当前占用的估算
-            used_memory_by_tasks = sum([p.get("gpu_memory", 0) for p in active_processes if p.get("gpu_device") == i])
+            # 尝试获取当前设备的实际显存使用情况
+            try:
+                torch.cuda.set_device(i)
+                memory_allocated = torch.cuda.memory_allocated(i) / (1024 ** 3)
+                memory_reserved = torch.cuda.memory_reserved(i) / (1024 ** 3)
+                actual_used = max(memory_allocated, memory_reserved)
+            except Exception:
+                # 如果无法获取实际使用情况，使用估算
+                actual_used = sum([p.get("gpu_memory", 0) for p in active_processes if p.get("gpu_device") == i])
             
             gpus.append({
                 "id": i,
                 "name": torch.cuda.get_device_name(i),
                 "memory_total": gpu_memory,
-                "memory_used": used_memory_by_tasks,
-                "memory_free": gpu_memory - used_memory_by_tasks
+                "memory_used": actual_used,
+                "memory_free": gpu_memory - actual_used,
+                "running_tasks": len([p for p in active_processes if p.get("gpu_device") == i])
             })
             
-            used_memory += used_memory_by_tasks
+            used_memory += actual_used
         
         return {
             "available": True,
@@ -140,11 +281,64 @@ def get_gpu_info() -> Dict[str, Any]:
             "total_memory": total_memory,
             "used_memory": used_memory,
             "free_memory": total_memory - used_memory,
-            "max_concurrent_tasks": max(1, int((total_memory - used_memory) / 10))  # 假设每个任务需要10GB
+            "max_concurrent_tasks": max(1, int((total_memory - used_memory) / 10))
         }
     except Exception as e:
         logger.error(f"获取GPU信息失败: {str(e)}")
         return {"available": False, "error": str(e), "gpus": [], "total_memory": 0, "used_memory": 0, "free_memory": 0}
+
+# 检查GPU资源是否足够启动新任务
+def check_gpu_resources_for_task(model_id: int, tensor_parallel_size: int = 1, max_model_len: int = 4096, quantization: Optional[str] = None) -> Dict[str, Any]:
+    """检查GPU资源是否足够启动新任务"""
+    # 获取实时GPU信息
+    gpu_info = get_gpu_info()
+    
+    if not gpu_info["available"]:
+        return {
+            "sufficient": False,
+            "reason": "没有可用的GPU",
+            "gpu_info": gpu_info
+        }
+    
+    # 估算新任务的显存需求
+    estimated_memory = estimate_model_memory(
+        model_id=model_id,
+        tensor_parallel_size=tensor_parallel_size,
+        max_model_len=max_model_len,
+        quantization=quantization
+    )
+    
+    # 检查是否有足够的空闲显存
+    if estimated_memory > gpu_info["free_memory"]:
+        return {
+            "sufficient": False,
+            "reason": f"显存不足: 需要 {estimated_memory:.1f}GB, 实际空闲 {gpu_info['free_memory']:.1f}GB",
+            "required_memory": estimated_memory,
+            "available_memory": gpu_info["free_memory"],
+            "gpu_info": gpu_info
+        }
+    
+    # 添加安全余量检查（保留10%的显存作为缓冲）
+    safety_margin = gpu_info["total_memory"] * 0.1
+    effective_available = gpu_info["free_memory"] - safety_margin
+    
+    if estimated_memory > effective_available:
+        return {
+            "sufficient": False,
+            "reason": f"显存不足（含安全余量）: 需要 {estimated_memory:.1f}GB, 有效可用 {effective_available:.1f}GB",
+            "required_memory": estimated_memory,
+            "available_memory": gpu_info["free_memory"],
+            "effective_available": effective_available,
+            "safety_margin": safety_margin,
+            "gpu_info": gpu_info
+        }
+    
+    return {
+        "sufficient": True,
+        "required_memory": estimated_memory,
+        "available_memory": gpu_info["free_memory"],
+        "gpu_info": gpu_info
+    }
 
 # 构建vLLM启动命令
 def build_vllm_command(task: InferenceTask, model_path: str) -> List[str]:
@@ -324,7 +518,12 @@ async def start_inference_service(task_id: int) -> bool:
             "process": process,
             "command": command_str,
             "port": used_port,
-            "gpu_memory": estimate_model_memory(task.model_id, task.tensor_parallel_size),
+            "gpu_memory": estimate_model_memory(
+                model_id=task.model_id, 
+                tensor_parallel_size=task.tensor_parallel_size,
+                max_model_len=task.max_model_len,
+                quantization=task.quantization
+            ),
             "gpu_device": 0  # 默认使用第一个GPU
         }
         active_processes.append(process_info)

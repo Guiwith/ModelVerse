@@ -4,6 +4,8 @@
 
 ModelVerse是一个功能强大的大语言模型(LLM)一体化推训平台，致力于为AI开发者和研究者提供完整的模型生命周期管理解决方案。从模型管理到推理部署，从训练微调到性能评估，ModelVerse将复杂的AI工作流程简化为直观易用的一体化平台。
 
+### 项目当前仍处于MVP阶段，此外当前项目版本迭代较快，欢迎在issue留下意见
+
 ![](assets\1.png)
 
 ![](assets\2.png)
@@ -64,6 +66,36 @@ ModelVerse是一个功能强大的大语言模型(LLM)一体化推训平台，�
 - Node.js 16+
 - PostgreSQL 12+
 - CUDA 11.0+ (GPU推理)
+
+## linux部署教程(由于vllm需要Linux环境，windows请尝试在wsl中部署)
+1. 克隆项目
+
+   ```
+   https://github.com/Guiwith/ModelVerse.git
+   ```
+
+2. 创建虚拟环境
+
+   ```
+   python -m venv venv(这里使用pyvenv)
+   source venv/bin/activate
+   ```
+
+3. 安装依赖(注意由于依赖冲突，需要首先安装其他依赖后再次安装vllm)
+
+   ```
+   pip install -r requirements.txt
+   pip install vllm
+   ```
+
+4. 启动后端
+
+   ```
+   cd modelverse
+   python main.py
+   ```
+
+5. 后端将会自动进行数据库部署创建，随后在 https://localhost:8888 开启访问
 
 ## 📖 使用指南
 

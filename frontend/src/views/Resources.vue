@@ -386,7 +386,7 @@ export default {
         }
         
         // 对于DOWNLOADING状态的资源，调用后端API取消
-        await api.apiClient.post(`/api/resources/${resourceId}/cancel`);
+        await api.apiClient.post(`/api/resources/${resourceId}/stop`);
         await loadResources(); // 刷新列表
       } catch (err) {
         console.error('取消下载失败:', err);
