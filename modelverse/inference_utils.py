@@ -359,7 +359,11 @@ def build_vllm_command(task: InferenceTask, model_path: str) -> List[str]:
         "--max-model-len", str(task.max_model_len),
         "--served-model-name", task.name,  # 添加模型名称参数
         "--disable-log-requests",  # 禁用详细请求日志
-        "--trust-remote-code"  # 信任远程代码，提高兼容性
+        "--trust-remote-code",  # 信任远程代码，提高兼容性
+        "--enforce-eager",  # 禁用torch.compile以加快启动速度
+        "--gpu-memory-utilization", "0.85",  # 降低GPU内存使用率，提高稳定性
+        "--max-num-batched-tokens", "4096",  # 限制批处理token数量
+        "--disable-log-stats"  # 禁用统计日志
     ]
     
     # 添加量化参数（如果启用）
@@ -542,11 +546,11 @@ async def start_inference_service(task_id: int) -> bool:
         logger.info(f"推理服务已启动: 任务={task_id}, PID={process.pid}, 端口={used_port}")
         
         # 等待服务启动 - 增加初始等待时间
-        await asyncio.sleep(5)
+        await asyncio.sleep(15)  # 增加到10秒，给模型加载更多时间
         
         # 检查服务是否成功启动
         tries = 0
-        max_tries = 20  # 增加尝试次数
+        max_tries = 40  # 增加到40次，总共约210秒超时
         while tries < max_tries:
             # 检查进程是否仍在运行
             if process.returncode is not None:
@@ -563,7 +567,7 @@ async def start_inference_service(task_id: int) -> bool:
             try:
                 # 检查服务健康状态
                 logger.info(f"尝试连接推理服务健康检查: http://localhost:{used_port}/v1/models (尝试 {tries+1}/{max_tries})")
-                response = requests.get(f"http://localhost:{used_port}/v1/models", timeout=5)
+                response = requests.get(f"http://localhost:{used_port}/v1/models", timeout=10)  # 增加单次请求超时
                 if response.status_code == 200:
                     logger.info(f"推理服务准备就绪: 任务={task_id}, 端口={used_port}, 响应={response.text[:100]}")
                     return True
@@ -574,7 +578,15 @@ async def start_inference_service(task_id: int) -> bool:
             except Exception as e:
                 logger.warning(f"推理服务健康检查出错: {str(e)}")
             
-            await asyncio.sleep(5)  # 增加等待间隔
+            # 根据尝试次数调整等待时间
+            if tries < 10:
+                wait_time = 3  # 前10次等待3秒
+            elif tries < 20:
+                wait_time = 5  # 中间10次等待5秒
+            else:
+                wait_time = 10  # 后面等待10秒
+                
+            await asyncio.sleep(wait_time)
             tries += 1
         
         # 尝试检查进程日志

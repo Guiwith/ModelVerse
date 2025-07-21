@@ -17,8 +17,25 @@ from pydantic import BaseModel
 import json
 import logging
 import time
-import importlib.metadata
+import importlib.metadata 
 import asyncio
+
+# 优化NumExpr性能设置
+# 设置NumExpr使用更多线程来提升科学计算性能
+try:
+    import numexpr as ne
+    # 设置NumExpr使用的最大线程数（建议为CPU核心数的1/2到1/4）
+    ne.set_num_threads(32)  # 您可以根据需要调整为16, 24, 32, 48等
+    print(f"✅ NumExpr已优化: 使用 {ne.nthreads} 个线程")
+except ImportError:
+    print("ℹ️  NumExpr未安装，跳过性能优化")
+except Exception as e:
+    print(f"⚠️  NumExpr优化失败: {str(e)}")
+
+# 设置环境变量以优化其他数值计算库
+os.environ.setdefault('NUMEXPR_MAX_THREADS', '32')
+os.environ.setdefault('OMP_NUM_THREADS', '32')
+os.environ.setdefault('MKL_NUM_THREADS', '32')
 
 from models import User, UserCreate, Token, UserRegister, ProfileUpdate, PasswordChange, ResourceType, DownloadStatus, ResourceCreate, Resource, MirrorSource, DownloadRequest, TrainingTask, TrainingTaskCreate, TrainingStatus, InferenceTask, InferenceTaskCreate, InferenceTaskUpdate, InferenceStatus, Message, ChatRequest, ChatResponse, EvaluationTask, EvaluationTaskCreate, EvaluationStatus, EvaluationMetrics
 from database import authenticate_user, create_user, get_users, init_db, check_username_exists, update_user_profile, update_user_password, create_resource, get_all_resources, get_user_resources, get_resource, update_resource_status, delete_resource, create_training_task, get_all_training_tasks, get_user_training_tasks, get_training_task, update_training_task, get_training_logs, create_inference_task, get_all_inference_tasks, get_user_inference_tasks, get_inference_task, update_inference_task, delete_inference_task, create_evaluation_task, get_all_evaluation_tasks, get_user_evaluation_tasks, get_evaluation_task, update_evaluation_task, delete_evaluation_task, get_evaluation_logs, add_evaluation_log, start_evaluation_task, stop_evaluation_task, delete_user_by_id
@@ -69,16 +86,23 @@ def datetime_json_serializer(obj):
 async def send_evaluation_log(task_id: int, log_data: str):
     """发送评估日志到WebSocket客户端"""
     if task_id in evaluation_ws_connections:
-        for websocket in list(evaluation_ws_connections.get(task_id, [])):
+        connections = list(evaluation_ws_connections.get(task_id, []))
+        logger.debug(f"发送评估日志到 {len(connections)} 个WebSocket连接, 任务ID: {task_id}")
+        
+        for websocket in connections:
             try:
                 await websocket.send_text(log_data)
+                logger.debug(f"成功发送日志到WebSocket, 任务ID: {task_id}")
             except Exception as e:
-                logger.error(f"WebSocket发送消息失败: {str(e)}")
+                logger.error(f"WebSocket发送消息失败, 任务ID: {task_id}, 错误: {str(e)}")
                 # 如果发送失败，可能是连接已关闭，从字典中移除
                 try:
                     evaluation_ws_connections[task_id].remove(websocket)
+                    logger.info(f"已移除无效的WebSocket连接, 任务ID: {task_id}")
                 except:
                     pass
+    else:
+        logger.debug(f"没有WebSocket连接用于任务ID: {task_id}")
 
 app = FastAPI()
 
@@ -91,11 +115,11 @@ app.add_middleware(
     allow_headers=["*"],  # 允许所有头部
 )
 
-# 配置静态文件服务 - 恢复到原来的配置
+# 配置静态文件服务 - 使用直接目录结构
 app.mount("/static", StaticFiles(directory="static"), name="static")
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
-app.mount("/models", StaticFiles(directory="LLM/models"), name="models")
-app.mount("/datasets", StaticFiles(directory="LLM/datasets"), name="datasets")
+app.mount("/models", StaticFiles(directory="models"), name="models")
+app.mount("/datasets", StaticFiles(directory="datasets"), name="datasets")
 
 # 存储验证码
 captcha_store: Dict[str, str] = {}
@@ -463,7 +487,7 @@ async def remove_resource(
         try:
             local_path = Path(resource.local_path)
             # 确保路径是在允许的目录内
-            allowed_dirs = ["./models", "./datasets", "LLM/models", "LLM/datasets"]
+            allowed_dirs = ["./models", "./datasets"]
             is_allowed = any(str(local_path).startswith(d) for d in allowed_dirs)
             
             if is_allowed and local_path.exists():
@@ -1557,8 +1581,8 @@ async def scan_local_resources(current_user: User = Depends(get_current_active_u
     result = {"added": [], "existing": [], "errors": []}
     
     # 扫描模型目录
-    models_dir = Path("./LLM/models")
-    datasets_dir = Path("./LLM/datasets")
+    models_dir = Path("./models")
+    datasets_dir = Path("./datasets")
     
     # 使用当前登录用户的ID
     user_id = current_user.id
@@ -1591,7 +1615,7 @@ async def scan_local_resources(current_user: User = Depends(get_current_active_u
                             resource_id=resource.id,
                             status=DownloadStatus.COMPLETED,
                             progress=1.0,
-                            local_path=f"LLM/models/{model_dir.name}"
+                            local_path=f"models/{model_dir.name}"
                         )
                         
                         result["added"].append(f"模型: {model_dir.name}")
@@ -1626,7 +1650,7 @@ async def scan_local_resources(current_user: User = Depends(get_current_active_u
                             resource_id=resource.id,
                             status=DownloadStatus.COMPLETED,
                             progress=1.0,
-                            local_path=f"LLM/datasets/{dataset_dir.name}"
+                            local_path=f"datasets/{dataset_dir.name}"
                         )
                         
                         result["added"].append(f"数据集: {dataset_dir.name}")
@@ -2035,9 +2059,23 @@ async def start_evaluation_task_api(
     
     # 更新任务状态
     try:
+        logger.info(f"正在启动评估任务 {task_id}")
         updated_task = start_evaluation_task(task_id)
-        return {"status": "success", "task": updated_task}
+        if updated_task:
+            logger.info(f"评估任务 {task_id} 已启动，状态: {updated_task.status}")
+            return {"status": "success", "task": updated_task}
+        else:
+            logger.error(f"启动评估任务 {task_id} 失败：任务不存在")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="任务不存在或已被删除"
+            )
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"启动评估任务 {task_id} 异常: {str(e)}")
+        import traceback
+        logger.error(f"错误详情: {traceback.format_exc()}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"启动评估任务失败: {str(e)}"
@@ -2074,8 +2112,21 @@ async def stop_evaluation_task_api(
     # 更新任务状态
     try:
         updated_task = stop_evaluation_task(task_id)
-        return {"status": "success", "task": updated_task}
+        if updated_task:
+            logger.info(f"评估任务 {task_id} 已停止")
+            return {"status": "success", "task": updated_task}
+        else:
+            logger.error(f"停止评估任务 {task_id} 失败：任务不存在")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="任务不存在或已被删除"
+            )
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"停止评估任务 {task_id} 异常: {str(e)}")
+        import traceback
+        logger.error(f"错误详情: {traceback.format_exc()}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"停止评估任务失败: {str(e)}"
@@ -2116,6 +2167,23 @@ async def get_benchmarks(
     benchmarks = evaluation_utils.get_available_benchmarks()
     return benchmarks
 
+@app.get("/api/evaluation/debug/websocket-status")
+async def get_websocket_status(
+    current_user: User = Depends(get_current_active_user)
+):
+    """获取WebSocket连接状态（调试用）"""
+    status_info = {}
+    for task_id, connections in evaluation_ws_connections.items():
+        status_info[task_id] = {
+            "connection_count": len(connections),
+            "connections": [f"WebSocket({id(ws)})" for ws in connections]
+        }
+    
+    return {
+        "total_tasks": len(evaluation_ws_connections),
+        "connections": status_info
+    }
+
 @app.websocket("/ws/evaluation/{task_id}")
 async def websocket_evaluation_logs(
     websocket: WebSocket,
@@ -2128,6 +2196,8 @@ async def websocket_evaluation_logs(
     if task_id not in evaluation_ws_connections:
         evaluation_ws_connections[task_id] = set()
     evaluation_ws_connections[task_id].add(websocket)
+    
+    logger.info(f"WebSocket连接已建立，任务ID: {task_id}, 当前连接数: {len(evaluation_ws_connections[task_id])}")
     
     # 定义最后一条日志的时间戳
     last_timestamp = datetime.min.isoformat()  # 使用ISO格式字符串
@@ -2317,7 +2387,26 @@ if __name__ == "__main__":
     
     # 显示系统信息
     import platform
-    logging.info(f"操作系统: {platform.system()} {platform.release()}")
+    
+    # 获取更准确的Windows版本信息
+    def get_windows_version():
+        if platform.system() == "Windows":
+            version = platform.version()
+            try:
+                # Windows 11的内部版本号是22000及以上
+                if version:
+                    build_number = int(version.split('.')[-1]) if '.' in version else int(version)
+                    if build_number >= 22000:
+                        return f"Windows 11 (Build {build_number})"
+                    else:
+                        return f"Windows 10 (Build {build_number})"
+            except:
+                pass
+            return f"Windows {platform.release()}"
+        else:
+            return f"{platform.system()} {platform.release()}"
+    
+    logging.info(f"操作系统: {get_windows_version()}")
     logging.info(f"Python版本: {platform.python_version()}")
     
     # 检查huggingface_hub版本
@@ -2330,4 +2419,4 @@ if __name__ == "__main__":
         logging.warning(f"无法检查huggingface_hub版本: {str(e)}")
     
     # 启动服务
-    uvicorn.run(app, host="0.0.0.0", port=8000) 
+    uvicorn.run(app, host="0.0.0.0", port=8888) 

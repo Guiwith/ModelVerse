@@ -1,449 +1,669 @@
 import os
-import json
-import logging
+import sqlite3
 from datetime import datetime
+from typing import List, Dict, Optional, Any, Tuple
+from contextlib import contextmanager
 from pathlib import Path
 from passlib.context import CryptContext
-from models import User, UserCreate, UserInDB, ProfileUpdate, Resource, ResourceCreate, DownloadStatus, ResourceType, TrainingTask, TrainingTaskCreate, TrainingStatus, TrainingLogEntry, InferenceTask, InferenceStatus, EvaluationTask, EvaluationTaskCreate, EvaluationStatus, EvaluationMetrics, EvaluationLogEntry, BenchmarkType
-from typing import List, Optional, Dict, Any, Union, Tuple
+import json
+import asyncio
 
-logger = logging.getLogger(__name__)
+from models import (
+    User, UserCreate, UserInDB, ProfileUpdate, 
+    Resource, ResourceCreate, ResourceType, DownloadStatus, 
+    TrainingTask, TrainingTaskCreate, TrainingStatus, TrainingLogEntry,
+    InferenceTask, InferenceStatus,
+    EvaluationTask, EvaluationTaskCreate, EvaluationStatus, EvaluationMetrics, EvaluationLogEntry
+)
 
 # 密码哈希工具
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# 数据库文件路径
-DB_PATH = Path("./db.json")
+# 数据库文件名
+DB_NAME = "modelverse.db"
 
-# 用户数据
-users_db = []
+def get_db_connection():
+    """获取数据库连接"""
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-# 模型和数据集
-resources_db = []
-
-# 训练任务相关数据
-training_tasks_db = []
-training_logs_db = []
-
-# 推理任务相关数据
-inference_tasks_db = []
-
-# 评估任务相关数据
-evaluation_tasks_db = []
-evaluation_logs_db = []
-
-# 初始化数据库
 def init_db():
-    global users_db, resources_db, training_tasks_db, training_logs_db, inference_tasks_db, evaluation_tasks_db, evaluation_logs_db
+    """初始化数据库表结构"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    # 如果数据库文件存在则加载，否则创建默认管理员
-    if os.path.exists(DB_PATH):
-        try:
-            with open(DB_PATH, "r") as f:
-                data = json.load(f)
-                # 修复数据加载错误：确保data是字典类型而不是列表
-                if isinstance(data, dict):
-                    users_db = data.get("users", [])
-                    resources_db = data.get("resources", [])
-                    training_tasks_db = data.get("training_tasks", [])
-                    training_logs_db = data.get("training_logs", [])
-                    inference_tasks_db = data.get("inference_tasks", [])
-                    evaluation_tasks_db = data.get("evaluation_tasks", [])
-                    evaluation_logs_db = data.get("evaluation_logs", [])
-                else:
-                    print("数据库格式错误：数据不是字典类型")
-                    users_db = []
-                    resources_db = []
-                    training_tasks_db = []
-                    training_logs_db = []
-                    inference_tasks_db = []
-                    evaluation_tasks_db = []
-                    evaluation_logs_db = []
-        except Exception as e:
-            print(f"加载数据库失败: {str(e)}")
-            users_db = []
-            resources_db = []
-            training_tasks_db = []
-            training_logs_db = []
-            inference_tasks_db = []
-            evaluation_tasks_db = []
-            evaluation_logs_db = []
+    # 创建用户表
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        hashed_password TEXT NOT NULL,
+        display_name TEXT DEFAULT '',
+        phone TEXT DEFAULT '',
+        is_admin BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
     
-    # 如果没有用户，创建默认管理员用户
-    if not users_db:
-        admin = UserCreate(
+    # 创建资源表
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS resources (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        description TEXT,
+        repo_id TEXT NOT NULL,
+        resource_type TEXT NOT NULL,
+        user_id INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        progress REAL DEFAULT 0.0,
+        size_mb REAL,
+        local_path TEXT,
+        error_message TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id)
+    )
+    ''')
+    
+    # 创建训练任务表
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS training_tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        base_model_id INTEGER NOT NULL,
+        dataset_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        progress REAL DEFAULT 0.0,
+        config_params TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        started_at TIMESTAMP,
+        completed_at TIMESTAMP,
+        error_message TEXT,
+        output_model_path TEXT,
+        FOREIGN KEY (user_id) REFERENCES users (id),
+        FOREIGN KEY (base_model_id) REFERENCES resources (id),
+        FOREIGN KEY (dataset_id) REFERENCES resources (id)
+    )
+    ''')
+    
+    # 创建训练日志表
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS training_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER NOT NULL,
+        content TEXT NOT NULL,
+        level TEXT DEFAULT 'INFO',
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (task_id) REFERENCES training_tasks (id)
+    )
+    ''')
+    
+    # 创建推理任务表
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS inference_tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        model_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        port INTEGER,
+        api_base TEXT,
+        process_id INTEGER,
+        gpu_memory REAL,
+        share_enabled BOOLEAN DEFAULT FALSE,
+        display_name TEXT,
+        tensor_parallel_size INTEGER DEFAULT 1,
+        max_model_len INTEGER DEFAULT 4096,
+        quantization TEXT,
+        dtype TEXT DEFAULT 'auto',
+        max_tokens INTEGER DEFAULT 2048,
+        temperature REAL DEFAULT 0.7,
+        top_p REAL DEFAULT 0.9,
+        top_k INTEGER DEFAULT 50,
+        repetition_penalty REAL DEFAULT 1.1,
+        presence_penalty REAL DEFAULT 0.0,
+        frequency_penalty REAL DEFAULT 0.0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        started_at TIMESTAMP,
+        stopped_at TIMESTAMP,
+        error_message TEXT,
+        FOREIGN KEY (user_id) REFERENCES users (id),
+        FOREIGN KEY (model_id) REFERENCES resources (id)
+    )
+    ''')
+    
+    # 创建评估任务表
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS evaluation_tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        model_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        benchmark_type TEXT NOT NULL,
+        status TEXT NOT NULL,
+        progress REAL DEFAULT 0.0,
+        num_fewshot INTEGER DEFAULT 0,
+        custom_dataset_path TEXT,
+        metrics TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        started_at TIMESTAMP,
+        completed_at TIMESTAMP,
+        error_message TEXT,
+        result_path TEXT,
+        FOREIGN KEY (user_id) REFERENCES users (id),
+        FOREIGN KEY (model_id) REFERENCES resources (id)
+    )
+    ''')
+    
+    # 创建评估日志表
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS evaluation_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER NOT NULL,
+        content TEXT NOT NULL,
+        level TEXT DEFAULT 'INFO',
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (task_id) REFERENCES evaluation_tasks (id)
+    )
+    ''')
+    
+    # 创建活跃下载任务表
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS active_downloads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        resource_id INTEGER NOT NULL,
+        pid INTEGER,
+        started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (resource_id) REFERENCES resources (id)
+    )
+    ''')
+    
+    conn.commit()
+    
+    # 创建默认管理员用户（如果不存在）
+    if not check_username_exists("admin"):
+        admin_user = UserCreate(
             username="admin",
-            email="admin@example.com",
+            email="admin@example.com", 
             password="admin123",
             is_admin=True
         )
-        create_user(admin)
-        save_db()
+        create_user(admin_user)
+    
+    conn.close()
 
-# 保存数据库
-def save_db():
-    with open(DB_PATH, "w") as f:
-        json.dump({
-            "users": users_db,
-            "resources": resources_db,
-            "training_tasks": training_tasks_db,
-            "training_logs": training_logs_db[:1000],  # 只保存最近的1000条日志
-            "inference_tasks": inference_tasks_db[:1000],  # 只保存最近的1000条推理任务
-            "evaluation_tasks": evaluation_tasks_db,
-            "evaluation_logs": evaluation_logs_db[:1000],  # 只保存最近的1000条评估日志
-        }, f, default=str)
-
-# 验证密码
+# 密码相关函数
 def verify_password(plain_password, hashed_password):
+    """验证密码"""
     return pwd_context.verify(plain_password, hashed_password)
 
-# 获取密码哈希
 def get_password_hash(password):
+    """获取密码哈希"""
     return pwd_context.hash(password)
 
-# 创建用户
-def create_user(user: UserCreate):
-    # 检查用户名是否已存在
+# 用户管理函数
+def create_user(user: UserCreate) -> User:
+    """创建用户"""
     if check_username_exists(user.username):
         raise Exception("用户名已存在")
     
-    # 生成用户ID
-    user_id = len(users_db) + 1
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    # 哈希密码
     hashed_password = get_password_hash(user.password)
     
-    # 创建用户对象
-    user_dict = user.dict()
-    user_dict.update({
-        "id": user_id,
-        "created_at": datetime.now(),
-        "hashed_password": hashed_password,
-        "display_name": "",  # 添加默认的个人资料字段
-        "phone": ""
-    })
-    del user_dict["password"]
+    cursor.execute('''
+    INSERT INTO users (username, email, hashed_password, display_name, phone, is_admin)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ''', (
+        user.username,
+        user.email,
+        hashed_password,
+        "",  # display_name
+        "",  # phone
+        user.is_admin
+    ))
     
-    # 添加到数据库
-    users_db.append(user_dict)
-    save_db()
+    user_id = cursor.lastrowid
+    conn.commit()
     
-    # 返回用户对象
-    return User(**user_dict)
+    # 获取创建的用户
+    cursor.execute('SELECT * FROM users WHERE id = ?', (user_id,))
+    user_data = cursor.fetchone()
+    conn.close()
+    
+    return User(**dict(user_data))
 
-# 通过用户名获取用户
-def get_user_by_username(username: str):
-    for user in users_db:
-        if user["username"] == username:
-            return UserInDB(**user)
+def get_user_by_username(username: str) -> Optional[UserInDB]:
+    """通过用户名获取用户"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT * FROM users WHERE username = ?', (username,))
+    user_data = cursor.fetchone()
+    conn.close()
+    
+    if user_data:
+        return UserInDB(**dict(user_data))
     return None
 
-# 通过ID获取用户
-def get_user_by_id(user_id: int):
-    for user in users_db:
-        if user["id"] == user_id:
-            return UserInDB(**user)
+def get_user_by_id(user_id: int) -> Optional[UserInDB]:
+    """通过ID获取用户"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT * FROM users WHERE id = ?', (user_id,))
+    user_data = cursor.fetchone()
+    conn.close()
+    
+    if user_data:
+        return UserInDB(**dict(user_data))
     return None
 
-# 检查用户名是否存在
 def check_username_exists(username: str) -> bool:
+    """检查用户名是否存在"""
     return get_user_by_username(username) is not None
 
-# 验证用户
-def authenticate_user(username: str, password: str):
+def authenticate_user(username: str, password: str) -> Optional[UserInDB]:
+    """验证用户"""
     user = get_user_by_username(username)
     if not user or not verify_password(password, user.hashed_password):
-        return False
+        return None
     return user
 
-# 更新用户个人资料
-def update_user_profile(user_id: int, profile_data: ProfileUpdate):
-    # 查找用户
-    for i, user in enumerate(users_db):
-        if user["id"] == user_id:
-            # 更新字段
-            if profile_data.display_name is not None:
-                users_db[i]["display_name"] = profile_data.display_name
-            if profile_data.email is not None:
-                users_db[i]["email"] = profile_data.email
-            if profile_data.phone is not None:
-                users_db[i]["phone"] = profile_data.phone
-            
-            # 保存数据库
-            save_db()
-            
-            # 返回更新后的用户
-            return User(**users_db[i])
+def get_users() -> List[User]:
+    """获取所有用户"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    # 如果没找到用户
-    raise Exception("用户不存在")
-
-# 更新用户密码
-def update_user_password(user_id: int, new_password: str):
-    # 查找用户
-    for i, user in enumerate(users_db):
-        if user["id"] == user_id:
-            # 更新密码
-            users_db[i]["hashed_password"] = get_password_hash(new_password)
-            
-            # 保存数据库
-            save_db()
-            return True
+    cursor.execute('SELECT * FROM users ORDER BY created_at DESC')
+    users_data = cursor.fetchall()
+    conn.close()
     
-    # 如果没找到用户
-    raise Exception("用户不存在")
+    return [User(**dict(user)) for user in users_data]
 
-# 删除用户
+def update_user_profile(user_id: int, profile_data: ProfileUpdate) -> User:
+    """更新用户资料"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # 构建更新字段
+    update_fields = []
+    params = []
+    
+    if profile_data.display_name is not None:
+        update_fields.append("display_name = ?")
+        params.append(profile_data.display_name)
+    
+    if profile_data.email is not None:
+        update_fields.append("email = ?")
+        params.append(profile_data.email)
+    
+    if profile_data.phone is not None:
+        update_fields.append("phone = ?")
+        params.append(profile_data.phone)
+    
+    if not update_fields:
+        raise Exception("没有需要更新的字段")
+    
+    params.append(user_id)
+    query = f"UPDATE users SET {', '.join(update_fields)} WHERE id = ?"
+    
+    cursor.execute(query, params)
+    conn.commit()
+    
+    # 获取更新后的用户
+    cursor.execute('SELECT * FROM users WHERE id = ?', (user_id,))
+    user_data = cursor.fetchone()
+    conn.close()
+    
+    if user_data:
+        return User(**dict(user_data))
+    else:
+        raise Exception("用户不存在")
+
+def update_user_password(user_id: int, new_password: str) -> bool:
+    """更新用户密码"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    hashed_password = get_password_hash(new_password)
+    cursor.execute('UPDATE users SET hashed_password = ? WHERE id = ?', (hashed_password, user_id))
+    updated = cursor.rowcount > 0
+    
+    conn.commit()
+    conn.close()
+    
+    if not updated:
+        raise Exception("用户不存在")
+    
+    return True
+
 def delete_user_by_id(user_id: int) -> bool:
-    # 查找用户
-    for i, user in enumerate(users_db):
-        if user["id"] == user_id:
-            # 删除用户
-            users_db.pop(i)
-            
-            # 保存数据库
-            save_db()
-            return True
+    """删除用户"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    # 如果没找到用户
-    return False
+    cursor.execute('DELETE FROM users WHERE id = ?', (user_id,))
+    deleted = cursor.rowcount > 0
+    
+    conn.commit()
+    conn.close()
+    
+    return deleted
 
-# 模型和数据集管理相关函数
-# 创建新的资源记录
+# 资源管理函数
 def create_resource(resource_data: ResourceCreate, user_id: int) -> Resource:
-    # 生成资源ID
-    resource_id = len(resources_db) + 1
+    """创建资源"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    # 创建时间
-    created_at = datetime.now()
+    cursor.execute('''
+    INSERT INTO resources (name, description, repo_id, resource_type, user_id, status)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ''', (
+        resource_data.name,
+        resource_data.description,
+        resource_data.repo_id,
+        resource_data.resource_type,
+        user_id,
+        DownloadStatus.PENDING
+    ))
     
-    # 创建资源对象
-    resource_dict = resource_data.dict()
-    resource_dict.update({
-        "id": resource_id,
-        "user_id": user_id,
-        "status": DownloadStatus.PENDING,
-        "progress": 0,
-        "local_path": None,
-        "error_message": None,
-        "created_at": created_at,
-        "updated_at": created_at,
-        "size_mb": None
-    })
+    resource_id = cursor.lastrowid
+    conn.commit()
     
-    # 添加到数据库
-    resources_db.append(resource_dict)
-    save_db()
+    # 获取创建的资源
+    cursor.execute('SELECT * FROM resources WHERE id = ?', (resource_id,))
+    resource_data = cursor.fetchone()
+    conn.close()
     
-    # 返回资源对象
-    return Resource(**resource_dict)
+    return Resource(**dict(resource_data))
 
-# 更新资源状态
-def update_resource_status(resource_id: int, status: DownloadStatus, progress: float = None, 
-                            error_message: str = None, local_path: str = None, size_mb: float = None):
-    # 查找资源
-    for i, resource in enumerate(resources_db):
-        if resource["id"] == resource_id:
-            # 更新字段
-            resources_db[i]["status"] = status
-            resources_db[i]["updated_at"] = datetime.now()
-            
-            if progress is not None:
-                resources_db[i]["progress"] = progress
-            
-            if error_message is not None:
-                resources_db[i]["error_message"] = error_message
-            
-            if local_path is not None:
-                resources_db[i]["local_path"] = local_path
-                
-            if size_mb is not None:
-                resources_db[i]["size_mb"] = size_mb
-            
-            # 保存数据库
-            save_db()
-            
-            # 返回更新后的资源
-            return Resource(**resources_db[i])
+def get_resource(resource_id: int) -> Optional[Resource]:
+    """获取单个资源"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    # 如果没找到资源
-    raise Exception("资源不存在")
-
-# 获取所有资源
-def get_all_resources():
-    return [Resource(**resource) for resource in resources_db]
-
-# 获取用户资源
-def get_user_resources(user_id: int):
-    return [Resource(**resource) for resource in resources_db if resource["user_id"] == user_id]
-
-# 获取资源详情
-def get_resource(resource_id: int):
-    for resource in resources_db:
-        if resource["id"] == resource_id:
-            return Resource(**resource)
+    cursor.execute('SELECT * FROM resources WHERE id = ?', (resource_id,))
+    resource_data = cursor.fetchone()
+    conn.close()
+    
+    if resource_data:
+        return Resource(**dict(resource_data))
     return None
 
-# 删除资源
-def delete_resource(resource_id: int):
-    global resources_db
-    for i, resource in enumerate(resources_db):
-        if resource["id"] == resource_id:
-            del resources_db[i]
-            save_db()
-            return True
-    return False
+def get_all_resources() -> List[Resource]:
+    """获取所有资源"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT * FROM resources ORDER BY created_at DESC')
+    resources_data = cursor.fetchall()
+    conn.close()
+    
+    return [Resource(**dict(resource)) for resource in resources_data]
 
-# 获取所有用户
-def get_users():
-    return [User(**user) for user in users_db]
+def get_user_resources(user_id: int) -> List[Resource]:
+    """获取用户资源"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT * FROM resources WHERE user_id = ? ORDER BY created_at DESC', (user_id,))
+    resources_data = cursor.fetchall()
+    conn.close()
+    
+    return [Resource(**dict(resource)) for resource in resources_data]
 
-# 训练任务管理功能
+def update_resource_status(resource_id: int, status: DownloadStatus, progress: float = None, 
+                          error_message: str = None, local_path: str = None, size_mb: float = None) -> Optional[Resource]:
+    """更新资源状态"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # 构建更新字段
+    update_fields = ["status = ?", "updated_at = CURRENT_TIMESTAMP"]
+    params = [status]
+    
+    if progress is not None:
+        update_fields.append("progress = ?")
+        params.append(progress)
+    
+    if error_message is not None:
+        update_fields.append("error_message = ?")
+        params.append(error_message)
+    
+    if local_path is not None:
+        update_fields.append("local_path = ?")
+        params.append(local_path)
+    
+    if size_mb is not None:
+        update_fields.append("size_mb = ?")
+        params.append(size_mb)
+    
+    params.append(resource_id)
+    query = f"UPDATE resources SET {', '.join(update_fields)} WHERE id = ?"
+    
+    cursor.execute(query, params)
+    conn.commit()
+    conn.close()
+    
+    # 获取更新后的资源
+    updated_resource = get_resource(resource_id)
+    
+    # 发送WebSocket通知
+    try:
+        # 动态导入以避免循环导入
+        from training_utils import broadcast_resource_update
+        
+        # 构建通知消息
+        message = {
+            "type": "resource_update",
+            "resource_id": resource_id,
+            "status": status,
+        }
+        
+        if progress is not None:
+            message["progress"] = progress
+        if error_message is not None:
+            message["error_message"] = error_message
+        
+        # 发送WebSocket通知，处理事件循环问题
+        try:
+            # 检查是否有运行中的事件循环
+            loop = asyncio.get_running_loop()
+            # 如果有运行中的事件循环，使用create_task
+            loop.create_task(broadcast_resource_update(message))
+        except RuntimeError:
+            # 没有运行中的事件循环，在新线程中运行
+            import threading
+            
+            def run_in_thread():
+                try:
+                    asyncio.run(broadcast_resource_update(message))
+                except Exception as e:
+                    print(f"线程中WebSocket通知失败: {e}")
+            
+            thread = threading.Thread(target=run_in_thread, daemon=True)
+            thread.start()
+            
+    except Exception as e:
+        # 如果WebSocket通知失败，记录错误但不影响主要功能
+        print(f"发送WebSocket通知失败: {e}")
+    
+    return updated_resource
+
+def delete_resource(resource_id: int) -> bool:
+    """删除资源"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('DELETE FROM resources WHERE id = ?', (resource_id,))
+    deleted = cursor.rowcount > 0
+    
+    conn.commit()
+    conn.close()
+    
+    return deleted
+
+# 训练任务管理函数
 def create_training_task(task_data: TrainingTaskCreate, user_id: int) -> TrainingTask:
-    """创建新的训练任务"""
-    global training_tasks_db
+    """创建训练任务"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    # 生成任务ID
-    task_id = len(training_tasks_db) + 1
+    config_params_json = json.dumps(task_data.config_params) if task_data.config_params else None
     
-    # 创建任务对象
-    task_dict = task_data.dict()
-    task_dict.update({
-        "id": task_id,
-        "user_id": user_id,
-        "status": TrainingStatus.PENDING,
-        "progress": 0.0,
-        "created_at": datetime.now(),
-        "config_path": None,
-        "output_path": None
-    })
+    cursor.execute('''
+    INSERT INTO training_tasks (name, base_model_id, dataset_id, user_id, status, config_params)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ''', (
+        task_data.name,
+        task_data.base_model_id,
+        task_data.dataset_id,
+        user_id,
+        TrainingStatus.PENDING,
+        config_params_json
+    ))
     
-    # 添加到数据库
-    training_tasks_db.append(task_dict)
-    save_db()
+    task_id = cursor.lastrowid
+    conn.commit()
     
-    # 返回任务对象
-    return TrainingTask(**task_dict)
+    # 获取创建的任务
+    cursor.execute('SELECT * FROM training_tasks WHERE id = ?', (task_id,))
+    task_data = cursor.fetchone()
+    conn.close()
+    
+    return TrainingTask(**dict(task_data))
+
+def get_training_task(task_id: int) -> Optional[TrainingTask]:
+    """获取训练任务"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT * FROM training_tasks WHERE id = ?', (task_id,))
+    task_data = cursor.fetchone()
+    conn.close()
+    
+    if task_data:
+        return TrainingTask(**dict(task_data))
+    return None
 
 def get_all_training_tasks() -> List[TrainingTask]:
     """获取所有训练任务"""
-    return [TrainingTask(**task) for task in training_tasks_db]
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT * FROM training_tasks ORDER BY created_at DESC')
+    tasks_data = cursor.fetchall()
+    conn.close()
+    
+    return [TrainingTask(**dict(task)) for task in tasks_data]
 
 def get_user_training_tasks(user_id: int) -> List[TrainingTask]:
-    """获取用户的训练任务"""
-    return [TrainingTask(**task) for task in training_tasks_db if task["user_id"] == user_id]
-
-def get_training_task(task_id: int) -> Optional[TrainingTask]:
-    """获取单个训练任务"""
-    for task in training_tasks_db:
-        if task["id"] == task_id:
-            return TrainingTask(**task)
-    return None
+    """获取用户训练任务"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT * FROM training_tasks WHERE user_id = ? ORDER BY created_at DESC', (user_id,))
+    tasks_data = cursor.fetchall()
+    conn.close()
+    
+    return [TrainingTask(**dict(task)) for task in tasks_data]
 
 def update_training_task(task_id: int, **kwargs) -> Optional[TrainingTask]:
-    """更新训练任务状态"""
-    for i, task in enumerate(training_tasks_db):
-        if task["id"] == task_id:
-            # 更新字段
-            for key, value in kwargs.items():
-                if key in task:
-                    training_tasks_db[i][key] = value
-            
-            # 保存数据库
-            save_db()
-            
-            # 返回更新后的任务
-            return TrainingTask(**training_tasks_db[i])
+    """更新训练任务"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    return None
+    # 构建更新字段
+    update_fields = []
+    params = []
+    
+    for key, value in kwargs.items():
+        if value is not None:
+            if key == "config_params":
+                update_fields.append(f"{key} = ?")
+                params.append(json.dumps(value))
+            else:
+                update_fields.append(f"{key} = ?")
+                params.append(value)
+    
+    if not update_fields:
+        return get_training_task(task_id)
+    
+    params.append(task_id)
+    query = f"UPDATE training_tasks SET {', '.join(update_fields)} WHERE id = ?"
+    
+    cursor.execute(query, params)
+    conn.commit()
+    conn.close()
+    
+    return get_training_task(task_id)
 
 def delete_training_task(task_id: int) -> bool:
     """删除训练任务"""
-    global training_tasks_db
-    for i, task in enumerate(training_tasks_db):
-        if task["id"] == task_id:
-            del training_tasks_db[i]
-            save_db()
-            return True
-    return False
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # 删除相关日志
+    cursor.execute('DELETE FROM training_logs WHERE task_id = ?', (task_id,))
+    # 删除任务
+    cursor.execute('DELETE FROM training_tasks WHERE id = ?', (task_id,))
+    
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    
+    return deleted
 
 def add_training_log(task_id: int, content: str, level: str = "INFO"):
     """添加训练日志"""
-    global training_logs_db
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    # 获取最新的数据
-    init_db()
+    cursor.execute('''
+    INSERT INTO training_logs (task_id, content, level)
+    VALUES (?, ?, ?)
+    ''', (task_id, content, level))
     
-    # 创建新的日志项
-    log_entry = TrainingLogEntry(
-        task_id=task_id,
-        content=content,
-        level=level,
-        timestamp=datetime.now().isoformat()
-    )
-    
-    # 限制每个任务的最大日志数量为500
-    task_logs = [log for log in training_logs_db if log["task_id"] == task_id]
-    if len(task_logs) >= 500:
-        # 如果超过500条，删除最早的日志
-        oldest_logs = sorted(task_logs, key=lambda x: x["timestamp"])[:len(task_logs) - 499]
-        training_logs_db = [log for log in training_logs_db if log["task_id"] != task_id or log not in oldest_logs]
-    
-    # 添加新日志
-    training_logs_db.append(log_entry.dict())
-    
-    # 每10条日志保存一次数据库
-    if len(training_logs_db) % 10 == 0:
-        save_db()
+    conn.commit()
+    conn.close()
 
 def get_training_logs(task_id: int, limit: int = 100, offset: int = 0) -> List[Dict]:
-    """获取训练任务的日志"""
-    # 过滤并统一时间戳格式
-    filtered_logs = []
-    for log in training_logs_db:
-        if log["task_id"] == task_id:
-            log_copy = log.copy()
-            # 确保时间戳是字符串
-            if isinstance(log_copy["timestamp"], datetime):
-                log_copy["timestamp"] = log_copy["timestamp"].isoformat()
-            filtered_logs.append(log_copy)
+    """获取训练日志"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    # 按时间戳逆序排序 (最新的在前面)
-    logs = sorted(
-        filtered_logs,
-        key=lambda x: x["timestamp"],
-        reverse=True
-    )
+    cursor.execute('''
+    SELECT * FROM training_logs 
+    WHERE task_id = ? 
+    ORDER BY timestamp DESC 
+    LIMIT ? OFFSET ?
+    ''', (task_id, limit, offset))
     
-    # 应用分页
-    if offset < len(logs):
-        return logs[offset:offset + limit]
-    return []
+    logs_data = cursor.fetchall()
+    conn.close()
+    
+    return [dict(log) for log in logs_data]
 
 def clear_training_logs(task_id: int) -> bool:
-    """清除指定任务的所有日志"""
-    global training_logs_db
+    """清除训练日志"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    # 记录原始日志数量
-    original_count = len(training_logs_db)
+    cursor.execute('DELETE FROM training_logs WHERE task_id = ?', (task_id,))
+    deleted = cursor.rowcount > 0
     
-    # 过滤掉指定任务的日志
-    training_logs_db = [log for log in training_logs_db if log["task_id"] != task_id]
+    conn.commit()
+    conn.close()
     
-    # 计算删除的日志数量
-    removed_count = original_count - len(training_logs_db)
-    
-    # 立即保存数据库，确保持久化
-    save_db()
-    
-    # 强制从磁盘重新加载数据库，确保清除生效
-    init_db()
-    
-    print(f"已清除任务 {task_id} 的日志，共 {removed_count} 条")
-    return True
+    return deleted
 
-# ========== 推理任务操作 ==========
-
+# 推理任务管理函数
 def create_inference_task(
     name: str,
     model_id: int,
@@ -463,388 +683,385 @@ def create_inference_task(
     frequency_penalty: float = 0.0
 ) -> Optional[InferenceTask]:
     """创建推理任务"""
-    # 检查模型是否存在
-    model = get_resource(resource_id=model_id)
-    if not model or model.resource_type != ResourceType.MODEL:
-        logger.error(f"模型不存在或类型错误: {model_id}")
-        return None
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    # 检查用户是否存在
-    user = get_user_by_id(user_id)
-    if not user:
-        logger.error(f"用户不存在: {user_id}")
-        return None
+    cursor.execute('''
+    INSERT INTO inference_tasks (
+        name, model_id, user_id, status, share_enabled, display_name,
+        tensor_parallel_size, max_model_len, quantization, dtype,
+        max_tokens, temperature, top_p, top_k, repetition_penalty,
+        presence_penalty, frequency_penalty
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        name, model_id, user_id, InferenceStatus.CREATING, share_enabled, display_name,
+        tensor_parallel_size, max_model_len, quantization, dtype,
+        max_tokens, temperature, top_p, top_k, repetition_penalty,
+        presence_penalty, frequency_penalty
+    ))
     
-    # 生成任务ID
-    task_id = len(inference_tasks_db) + 1
+    task_id = cursor.lastrowid
+    conn.commit()
     
-    # 创建任务
-    task = InferenceTask(
-        id=task_id,
-        name=name,
-        model_id=model_id,
-        user_id=user_id,
-        status=InferenceStatus.CREATING,
-        created_at=datetime.now(),
-        share_enabled=share_enabled,
-        display_name=display_name,
-        tensor_parallel_size=tensor_parallel_size,
-        max_model_len=max_model_len,
-        quantization=quantization,
-        dtype=dtype,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
-        repetition_penalty=repetition_penalty,
-        presence_penalty=presence_penalty,
-        frequency_penalty=frequency_penalty
-    )
+    # 获取创建的任务
+    cursor.execute('SELECT * FROM inference_tasks WHERE id = ?', (task_id,))
+    task_data = cursor.fetchone()
+    conn.close()
     
-    # 添加到数据库
-    inference_tasks_db.append(task.dict())
-    save_db()
-    
-    return task
+    if task_data:
+        return InferenceTask(**dict(task_data))
+    return None
 
 def get_inference_task(task_id: int) -> Optional[InferenceTask]:
     """获取推理任务"""
-    for task_data in inference_tasks_db:
-        if task_data["id"] == task_id:
-            return InferenceTask(**task_data)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT * FROM inference_tasks WHERE id = ?', (task_id,))
+    task_data = cursor.fetchone()
+    conn.close()
+    
+    if task_data:
+        return InferenceTask(**dict(task_data))
     return None
 
 def get_all_inference_tasks() -> List[InferenceTask]:
     """获取所有推理任务"""
-    return [InferenceTask(**task_data) for task_data in inference_tasks_db]
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT * FROM inference_tasks ORDER BY created_at DESC')
+    tasks_data = cursor.fetchall()
+    conn.close()
+    
+    return [InferenceTask(**dict(task)) for task in tasks_data]
 
 def get_user_inference_tasks(user_id: int) -> List[InferenceTask]:
-    """获取用户的推理任务"""
-    return [InferenceTask(**task_data) for task_data in inference_tasks_db if task_data["user_id"] == user_id]
-
-def update_inference_task(
-    task_id: int,
-    status: Optional[InferenceStatus] = None,
-    port: Optional[int] = None,
-    api_base: Optional[str] = None,
-    process_id: Optional[int] = None,
-    gpu_memory: Optional[float] = None,
-    started_at: Optional[datetime] = None,
-    stopped_at: Optional[datetime] = None,
-    error_message: Optional[str] = None,
-    max_tokens: Optional[int] = None,
-    temperature: Optional[float] = None,
-    top_p: Optional[float] = None,
-    top_k: Optional[int] = None,
-    repetition_penalty: Optional[float] = None,
-    presence_penalty: Optional[float] = None,
-    frequency_penalty: Optional[float] = None,
-    share_enabled: Optional[bool] = None,
-    display_name: Optional[str] = None
-) -> Optional[InferenceTask]:
-    """更新推理任务"""
-    for i, task_data in enumerate(inference_tasks_db):
-        if task_data["id"] == task_id:
-            # 更新状态
-            if status is not None:
-                task_data["status"] = status
-            
-            # 更新端口和API基础URL
-            if port is not None:
-                task_data["port"] = port
-            if api_base is not None:
-                task_data["api_base"] = api_base
-            if process_id is not None:
-                task_data["process_id"] = process_id
-            if gpu_memory is not None:
-                task_data["gpu_memory"] = gpu_memory
-            
-            # 更新时间戳
-            if started_at is not None:
-                task_data["started_at"] = started_at.isoformat()
-            if stopped_at is not None:
-                task_data["stopped_at"] = stopped_at.isoformat()
-            
-            # 更新错误信息
-            if error_message is not None:
-                task_data["error_message"] = error_message
-            
-            # 更新共享设置
-            if share_enabled is not None:
-                task_data["share_enabled"] = share_enabled
-            if display_name is not None:
-                task_data["display_name"] = display_name
-            
-            # 更新推理参数
-            if max_tokens is not None:
-                task_data["max_tokens"] = max_tokens
-            if temperature is not None:
-                task_data["temperature"] = temperature
-            if top_p is not None:
-                task_data["top_p"] = top_p
-            if top_k is not None:
-                task_data["top_k"] = top_k
-            if repetition_penalty is not None:
-                task_data["repetition_penalty"] = repetition_penalty
-            if presence_penalty is not None:
-                task_data["presence_penalty"] = presence_penalty
-            if frequency_penalty is not None:
-                task_data["frequency_penalty"] = frequency_penalty
-            
-            # 保存数据库
-            inference_tasks_db[i] = task_data
-            save_db()
-            
-            return InferenceTask(**task_data)
+    """获取用户推理任务"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    return None
+    cursor.execute('SELECT * FROM inference_tasks WHERE user_id = ? ORDER BY created_at DESC', (user_id,))
+    tasks_data = cursor.fetchall()
+    conn.close()
+    
+    return [InferenceTask(**dict(task)) for task in tasks_data]
+
+def update_inference_task(task_id: int, **kwargs) -> Optional[InferenceTask]:
+    """更新推理任务"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # 构建更新字段
+    update_fields = []
+    params = []
+    
+    for key, value in kwargs.items():
+        if value is not None:
+            update_fields.append(f"{key} = ?")
+            params.append(value)
+    
+    if not update_fields:
+        return get_inference_task(task_id)
+    
+    params.append(task_id)
+    query = f"UPDATE inference_tasks SET {', '.join(update_fields)} WHERE id = ?"
+    
+    cursor.execute(query, params)
+    conn.commit()
+    conn.close()
+    
+    return get_inference_task(task_id)
 
 def delete_inference_task(task_id: int) -> bool:
     """删除推理任务"""
-    for i, task_data in enumerate(inference_tasks_db):
-        if task_data["id"] == task_id:
-            inference_tasks_db.pop(i)
-            save_db()
-            return True
-    return False
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('DELETE FROM inference_tasks WHERE id = ?', (task_id,))
+    deleted = cursor.rowcount > 0
+    
+    conn.commit()
+    conn.close()
+    
+    return deleted
 
-# ========== 评估任务操作 ==========
-
-def create_evaluation_task(
-    task_data: EvaluationTaskCreate, 
-    user_id: int
-) -> EvaluationTask:
-    """
-    创建新的评估任务
-    """
-    # 生成任务ID
-    task_id = len(evaluation_tasks_db) + 1
-    
-    # 创建任务对象
-    task_dict = task_data.dict()
-    task_dict.update({
-        "id": task_id,
-        "user_id": user_id,
-        "status": EvaluationStatus.PENDING,
-        "progress": 0.0,
-        "metrics": None,
-        "created_at": datetime.now(),
-        "started_at": None,
-        "completed_at": None,
-        "error_message": None
-    })
-    
-    # 添加到数据库
-    evaluation_tasks_db.append(task_dict)
-    save_db()
-    
-    # 返回任务对象
+# 评估任务管理函数
+def _process_evaluation_task_data(task_data) -> EvaluationTask:
+    """处理评估任务数据，包括metrics字段的JSON反序列化"""
+    task_dict = dict(task_data)
+    # 处理metrics字段的JSON反序列化
+    if task_dict.get('metrics'):
+        try:
+            metrics_data = json.loads(task_dict['metrics'])
+            from models import EvaluationMetrics
+            task_dict['metrics'] = EvaluationMetrics(**metrics_data)
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            print(f"解析metrics失败: {str(e)}")
+            task_dict['metrics'] = None
     return EvaluationTask(**task_dict)
+
+def create_evaluation_task(task_data: EvaluationTaskCreate, user_id: int) -> EvaluationTask:
+    """创建评估任务"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    INSERT INTO evaluation_tasks (name, model_id, user_id, benchmark_type, status, num_fewshot, custom_dataset_path)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        task_data.name,
+        task_data.model_id,
+        user_id,
+        task_data.benchmark_type,
+        EvaluationStatus.PENDING,
+        task_data.num_fewshot,
+        task_data.custom_dataset_path
+    ))
+    
+    task_id = cursor.lastrowid
+    conn.commit()
+    
+    # 获取创建的任务
+    cursor.execute('SELECT * FROM evaluation_tasks WHERE id = ?', (task_id,))
+    task_data = cursor.fetchone()
+    conn.close()
+    
+    return EvaluationTask(**dict(task_data))
+
+def get_evaluation_task(task_id: int) -> Optional[EvaluationTask]:
+    """获取评估任务"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT * FROM evaluation_tasks WHERE id = ?', (task_id,))
+    task_data = cursor.fetchone()
+    conn.close()
+    
+    if task_data:
+        return _process_evaluation_task_data(task_data)
+    return None
 
 def get_all_evaluation_tasks() -> List[EvaluationTask]:
     """获取所有评估任务"""
-    return [EvaluationTask(**task) for task in evaluation_tasks_db]
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT * FROM evaluation_tasks ORDER BY created_at DESC')
+    tasks_data = cursor.fetchall()
+    conn.close()
+    
+    return [_process_evaluation_task_data(task) for task in tasks_data]
 
 def get_user_evaluation_tasks(user_id: int) -> List[EvaluationTask]:
-    """获取用户的评估任务"""
-    return [EvaluationTask(**task) for task in evaluation_tasks_db if task["user_id"] == user_id]
-
-def get_evaluation_task(task_id: int) -> Optional[EvaluationTask]:
-    """通过ID获取评估任务"""
-    for task in evaluation_tasks_db:
-        if task["id"] == task_id:
-            return EvaluationTask(**task)
-    return None
-
-def update_evaluation_task(
-    task_id: int,
-    status: Optional[EvaluationStatus] = None,
-    progress: Optional[float] = None,
-    metrics: Optional[EvaluationMetrics] = None,
-    metrics_dict: Optional[Dict[str, Any]] = None,
-    started_at: Optional[datetime] = None,
-    completed_at: Optional[datetime] = None,
-    error_message: Optional[str] = None,
-    result_path: Optional[str] = None
-) -> Optional[EvaluationTask]:
-    """更新评估任务状态"""
-    for i, task in enumerate(evaluation_tasks_db):
-        if task["id"] == task_id:
-            # 更新状态
-            if status is not None:
-                evaluation_tasks_db[i]["status"] = status.value if isinstance(status, EvaluationStatus) else status
-            
-            # 更新进度
-            if progress is not None:
-                evaluation_tasks_db[i]["progress"] = progress
-            
-            # 更新指标 - 支持两种方式传入指标
-            if metrics is not None:
-                # 如果直接传入EvaluationMetrics对象
-                if isinstance(metrics, EvaluationMetrics):
-                    evaluation_tasks_db[i]["metrics"] = metrics.dict()
-                else:
-                    # 否则假设已经是字典形式
-                    evaluation_tasks_db[i]["metrics"] = metrics
-            
-            # 新增：使用已序列化的metrics字典
-            if metrics_dict is not None:
-                evaluation_tasks_db[i]["metrics"] = metrics_dict
-            
-            # 更新时间
-            if started_at is not None:
-                timestamp = started_at
-                if isinstance(started_at, datetime):
-                    timestamp = started_at.isoformat()
-                evaluation_tasks_db[i]["started_at"] = timestamp
-            
-            if completed_at is not None:
-                timestamp = completed_at
-                if isinstance(completed_at, datetime):
-                    timestamp = completed_at.isoformat()
-                evaluation_tasks_db[i]["completed_at"] = timestamp
-            
-            # 更新错误信息
-            if error_message is not None:
-                evaluation_tasks_db[i]["error_message"] = error_message
-            
-            # 更新结果路径
-            if result_path is not None:
-                evaluation_tasks_db[i]["result_path"] = result_path
-            
-            # 保存数据库
-            save_db()
-            
-            # 返回更新后的任务
-            return EvaluationTask(**evaluation_tasks_db[i])
+    """获取用户评估任务"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    return None
+    cursor.execute('SELECT * FROM evaluation_tasks WHERE user_id = ? ORDER BY created_at DESC', (user_id,))
+    tasks_data = cursor.fetchall()
+    conn.close()
+    
+    return [_process_evaluation_task_data(task) for task in tasks_data]
+
+def update_evaluation_task(task_id: int, **kwargs) -> Optional[EvaluationTask]:
+    """更新评估任务"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # 构建更新字段
+    update_fields = []
+    params = []
+    
+    for key, value in kwargs.items():
+        if value is not None:
+            if key == "metrics":
+                update_fields.append(f"{key} = ?")
+                params.append(json.dumps(value))
+            else:
+                update_fields.append(f"{key} = ?")
+                params.append(value)
+    
+    if not update_fields:
+        return get_evaluation_task(task_id)
+    
+    params.append(task_id)
+    query = f"UPDATE evaluation_tasks SET {', '.join(update_fields)} WHERE id = ?"
+    
+    cursor.execute(query, params)
+    conn.commit()
+    conn.close()
+    
+    return get_evaluation_task(task_id)
 
 def delete_evaluation_task(task_id: int) -> bool:
     """删除评估任务"""
-    global evaluation_tasks_db
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    # 找到并移除任务
-    for i, task in enumerate(evaluation_tasks_db):
-        if task["id"] == task_id:
-            evaluation_tasks_db.pop(i)
-            save_db()
-            
-            # 删除评估配置文件
-            from evaluation_utils import delete_evaluation_task_config
-            delete_evaluation_task_config(task_id)
-            
-            # 删除关联的日志 - 新增
-            clear_evaluation_logs(task_id)
-            
-            return True
+    # 删除相关日志
+    cursor.execute('DELETE FROM evaluation_logs WHERE task_id = ?', (task_id,))
+    # 删除任务
+    cursor.execute('DELETE FROM evaluation_tasks WHERE id = ?', (task_id,))
     
-    return False
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    
+    return deleted
 
 def start_evaluation_task(task_id: int) -> Optional[EvaluationTask]:
-    """启动评估任务"""
-    # 获取任务
-    task = get_evaluation_task(task_id)
-    if not task:
-        return None
-    
+    """开始评估任务"""
     # 更新任务状态
-    updated_task = update_evaluation_task(
-        task_id=task_id,
-        status=EvaluationStatus.PENDING,
-        progress=0.0,
-        started_at=datetime.now(),
-        completed_at=None,
-        error_message=None
+    task = update_evaluation_task(
+        task_id,
+        status=EvaluationStatus.RUNNING,
+        started_at=datetime.now()
     )
     
-    # 启动评估任务
-    from evaluation_utils import start_evaluation
-    start_evaluation(task_id)
+    # 实际启动评估流程
+    if task:
+        try:
+            import evaluation_utils
+            # 将任务添加到运行中的任务字典
+            evaluation_utils.running_evaluations[task_id] = True
+            evaluation_utils.start_evaluation(task_id)
+        except Exception as e:
+            # 如果启动失败，更新状态为失败并清理运行状态
+            import evaluation_utils
+            if task_id in evaluation_utils.running_evaluations:
+                del evaluation_utils.running_evaluations[task_id]
+            task = update_evaluation_task(
+                task_id,
+                status=EvaluationStatus.FAILED,
+                error_message=f"启动评估失败: {str(e)}",
+                completed_at=datetime.now()
+            )
     
-    return updated_task
+    return task
 
 def stop_evaluation_task(task_id: int) -> Optional[EvaluationTask]:
     """停止评估任务"""
-    # 获取任务
-    task = get_evaluation_task(task_id)
-    if not task:
-        return None
-    
-    # 停止评估
-    from evaluation_utils import stop_evaluation
-    stop_evaluation(task_id)
+    # 实际停止评估流程
+    try:
+        import evaluation_utils
+        evaluation_utils.stop_evaluation(task_id)
+    except Exception as e:
+        print(f"停止评估流程失败: {str(e)}")
     
     # 更新任务状态
-    updated_task = update_evaluation_task(
-        task_id=task_id,
-        status=EvaluationStatus.STOPPED
+    return update_evaluation_task(
+        task_id,
+        status=EvaluationStatus.STOPPED,
+        stopped_at=datetime.now()
     )
-    
-    return updated_task
 
-def add_evaluation_log(
-    task_id: int,
-    content: str,
-    level: str = "INFO"
-) -> EvaluationLogEntry:
+def add_evaluation_log(task_id: int, content: str, level: str = "INFO") -> EvaluationLogEntry:
     """添加评估日志"""
-    # 创建日志条目
-    log_entry = {
-        "task_id": task_id,
-        "timestamp": datetime.now().isoformat(),  # 存储为ISO格式字符串
-        "content": content,
-        "level": level
-    }
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    # 添加到数据库
-    evaluation_logs_db.append(log_entry)
+    cursor.execute('''
+    INSERT INTO evaluation_logs (task_id, content, level)
+    VALUES (?, ?, ?)
+    ''', (task_id, content, level))
     
-    # 如果日志太多，保留最新的10000条
-    if len(evaluation_logs_db) > 10000:
-        evaluation_logs_db.pop(0)
+    log_id = cursor.lastrowid
+    conn.commit()
     
-    # 隔一段时间保存一次，避免频繁写入
-    if len(evaluation_logs_db) % 100 == 0:
-        save_db()
+    # 获取创建的日志
+    cursor.execute('SELECT * FROM evaluation_logs WHERE id = ?', (log_id,))
+    log_data = cursor.fetchone()
+    conn.close()
+    
+    return EvaluationLogEntry(**dict(log_data))
 
 def get_evaluation_logs(task_id: int, limit: int = 100, offset: int = 0) -> List[Dict]:
     """获取评估日志"""
-    # 过滤出任务的日志
-    task_logs = [log for log in evaluation_logs_db if log["task_id"] == task_id]
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    # 统一时间戳格式（确保所有时间戳都是字符串类型）
-    for log in task_logs:
-        if isinstance(log["timestamp"], datetime):
-            log["timestamp"] = log["timestamp"].isoformat()
+    cursor.execute('''
+    SELECT * FROM evaluation_logs 
+    WHERE task_id = ? 
+    ORDER BY timestamp DESC 
+    LIMIT ? OFFSET ?
+    ''', (task_id, limit, offset))
     
-    # 按时间排序
-    task_logs.sort(key=lambda x: x["timestamp"], reverse=True)
+    logs_data = cursor.fetchall()
+    conn.close()
     
-    # 应用分页
-    paginated_logs = task_logs[offset:offset + limit]
-    
-    return paginated_logs
+    return [dict(log) for log in logs_data]
 
 def clear_evaluation_logs(task_id: int) -> bool:
     """清除评估日志"""
-    global evaluation_logs_db
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    # 记录原始日志数量
-    original_count = len(evaluation_logs_db)
+    cursor.execute('DELETE FROM evaluation_logs WHERE task_id = ?', (task_id,))
+    deleted = cursor.rowcount > 0
     
-    # 移除任务的日志
-    evaluation_logs_db = [log for log in evaluation_logs_db if log["task_id"] != task_id]
+    conn.commit()
+    conn.close()
     
-    # 计算移除的日志数
-    removed_count = original_count - len(evaluation_logs_db)
+    return deleted
+
+# 下载任务管理函数
+def register_download_task(resource_id: int, pid: int) -> int:
+    """记录活跃下载任务"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    # 立即保存数据库，确保持久化
-    save_db()
+    cursor.execute('''
+    INSERT INTO active_downloads (resource_id, pid)
+    VALUES (?, ?)
+    ''', (resource_id, pid))
     
-    # 强制从磁盘重新加载数据库，确保清除生效
-    init_db()
+    download_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
     
-    logger.info(f"已清除任务 {task_id} 的评估日志，共 {removed_count} 条")
+    return download_id
+
+def remove_download_task(resource_id: int) -> None:
+    """移除下载任务记录"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    return True 
+    cursor.execute('DELETE FROM active_downloads WHERE resource_id = ?', (resource_id,))
+    conn.commit()
+    conn.close()
+
+def get_active_downloads() -> List[Dict[str, Any]]:
+    """获取所有活跃下载任务"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    SELECT ad.*, r.name, r.repo_id, r.resource_type, r.user_id, r.progress, r.status, u.username
+    FROM active_downloads ad
+    JOIN resources r ON ad.resource_id = r.id
+    JOIN users u ON r.user_id = u.id
+    ORDER BY ad.started_at DESC
+    ''')
+    
+    downloads = cursor.fetchall()
+    conn.close()
+    
+    return [dict(download) for download in downloads]
+
+def get_download_task(resource_id: int) -> Optional[Dict[str, Any]]:
+    """获取资源的下载任务信息"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT * FROM active_downloads WHERE resource_id = ?', (resource_id,))
+    task = cursor.fetchone()
+    conn.close()
+    
+    return dict(task) if task else None
+
+# 兼容性函数（保持与原database.py的API兼容）
+def save_db():
+    """保存数据库（SQLite自动保存，这里保持兼容性）"""
+    pass 

@@ -36,7 +36,6 @@ print(f"当前huggingface_hub版本: {hf_version}")
 cache_home = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hf_cache")
 os.environ["HF_HOME"] = cache_home
 os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.join(cache_home, "hub")
-os.environ["TRANSFORMERS_CACHE"] = os.path.join(cache_home, "transformers")
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
@@ -47,7 +46,6 @@ if platform.system() != "Windows":
     
 # 确保所有缓存目录存在
 os.makedirs(os.environ["HUGGINGFACE_HUB_CACHE"], exist_ok=True)
-os.makedirs(os.environ["TRANSFORMERS_CACHE"], exist_ok=True)
 if platform.system() != "Windows":
     os.makedirs(os.environ["TMPDIR"], exist_ok=True)
 

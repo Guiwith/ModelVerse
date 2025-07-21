@@ -49,15 +49,17 @@ SUPPORTED_DATASETS = {
 
 # 在配置部分添加默认配置常量
 MMLU_EVALUATION_CONFIG = {
-    "max_new_tokens": 32,
+    "max_new_tokens": 64,  # 优化token限制，对于单选题足够了
     "temperature": 0.01,
     "use_default_model_params": True,  # 是否优先使用模型自带参数
+    "use_structured_output": False,  # 是否使用结构化输出（JSON格式）
+    "use_vllm": False,  # 是否使用vLLM引擎
     "generation_params": {
         "temperature": 0.01,        # 低温度，减少随机性
-        "top_p": 0.95,              # 稍微放宽筛选
+        "top_p": 0.9,               # 严格筛选，避免生成无关内容
         "do_sample": False,         # 关闭采样，使用贪婪解码
         "num_return_sequences": 1,
-        "repetition_penalty": 1.2   # 增强对重复的惩罚
+        "repetition_penalty": 1.1   # 轻微惩罚重复，避免干扰单字母输出
     }
 }
 
@@ -99,7 +101,6 @@ def download_dataset(dataset_id: str, mirror: bool = True) -> Tuple[bool, str]:
     try:
         # 设置环境变量
         os.environ["HF_DATASETS_CACHE"] = cache_dir
-        os.environ["TRANSFORMERS_CACHE"] = cache_dir
         os.environ["HF_DATASETS_TRUST_REMOTE_CODE"] = "1"
         os.environ["TRANSFORMERS_TRUST_REMOTE_CODE"] = "1"
         
@@ -239,7 +240,7 @@ def create_evaluation_config(task: EvaluationTask) -> Tuple[str, str, str]:
         "output_dir": output_dir,
         "parameters": {
             # 基本生成参数
-            "max_new_tokens": 32,
+            "max_new_tokens": 128,  # 增加token限制，允许更完整的回答
             "temperature": 0.01,
             "use_default_model_params": True,
             
@@ -429,7 +430,6 @@ def run_mmlu_evaluation(task_id: int, model_path: str, output_dir: str, cache_di
         os.environ["HF_DATASETS_TRUST_REMOTE_CODE"] = "1"
         os.environ["TRANSFORMERS_TRUST_REMOTE_CODE"] = "1"
         os.environ["HF_DATASETS_CACHE"] = cache_dir
-        os.environ["TRANSFORMERS_CACHE"] = cache_dir
         
         # 设置随机种子
         random_module.seed(42)
@@ -442,12 +442,83 @@ def run_mmlu_evaluation(task_id: int, model_path: str, output_dir: str, cache_di
         # 加载模型和分词器
         add_evaluation_log(task_id, "加载模型和分词器...")
         
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True
-        )
+        # 检查GPU内存并选择合适的配置
+        import torch
+        try:
+            if torch.cuda.is_available():
+                gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # GB
+                add_evaluation_log(task_id, f"检测到GPU内存: {gpu_memory:.1f} GB")
+                
+                # 根据GPU内存选择加载策略
+                model_kwargs = {
+                    "trust_remote_code": True,
+                    "low_cpu_mem_usage": True,
+                }
+                
+                if gpu_memory < 8:  # 小于8GB使用更激进的优化
+                    add_evaluation_log(task_id, "GPU内存较小，使用量化和CPU卸载优化")
+                    model_kwargs.update({
+                        "torch_dtype": torch.float16,
+                        "device_map": "auto",
+                        "load_in_8bit": True,  # 8位量化
+                        "max_memory": {0: f"{int(gpu_memory * 0.8)}GB", "cpu": "16GB"}
+                    })
+                elif gpu_memory < 16:  # 8-16GB使用中等优化
+                    add_evaluation_log(task_id, "GPU内存中等，使用半精度优化")
+                    model_kwargs.update({
+                        "torch_dtype": torch.bfloat16,
+                        "device_map": "auto",
+                        "max_memory": {0: f"{int(gpu_memory * 0.9)}GB", "cpu": "8GB"}
+                    })
+                else:  # 大于16GB使用标准配置
+                    add_evaluation_log(task_id, "GPU内存充足，使用标准配置")
+                    model_kwargs.update({
+                        "torch_dtype": torch.bfloat16,
+                        "device_map": "auto"
+                    })
+            else:
+                add_evaluation_log(task_id, "未检测到GPU，使用CPU模式")
+                model_kwargs = {
+                    "torch_dtype": torch.float32,
+                    "device_map": "cpu",
+                    "trust_remote_code": True,
+                    "low_cpu_mem_usage": True
+                }
+        except Exception as e:
+            add_evaluation_log(task_id, f"GPU检测失败，使用默认配置: {str(e)}", "WARNING")
+            model_kwargs = {
+                "torch_dtype": torch.bfloat16,
+                "device_map": "auto",
+                "trust_remote_code": True
+            }
+        
+        try:
+            model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
+            
+            # 显示模型加载后的状态信息
+            if hasattr(model, 'hf_device_map') and model.hf_device_map:
+                add_evaluation_log(task_id, f"模型设备映射: {model.hf_device_map}")
+            
+            # 显示GPU内存使用情况
+            if torch.cuda.is_available():
+                for i in range(torch.cuda.device_count()):
+                    memory_allocated = torch.cuda.memory_allocated(i) / (1024**3)
+                    memory_reserved = torch.cuda.memory_reserved(i) / (1024**3)
+                    memory_total = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+                    add_evaluation_log(task_id, f"GPU {i} 内存使用: {memory_allocated:.1f}GB allocated, {memory_reserved:.1f}GB reserved, {memory_total:.1f}GB total")
+            
+            add_evaluation_log(task_id, "模型加载成功")
+        except Exception as e:
+            add_evaluation_log(task_id, f"模型加载失败，尝试CPU模式: {str(e)}", "WARNING")
+            # 回退到CPU模式
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                torch_dtype=torch.float32,
+                device_map="cpu",
+                trust_remote_code=True,
+                low_cpu_mem_usage=True
+            )
+            add_evaluation_log(task_id, "模型已在CPU模式下加载")
         
         tokenizer = AutoTokenizer.from_pretrained(
             model_path,
@@ -455,44 +526,217 @@ def run_mmlu_evaluation(task_id: int, model_path: str, output_dir: str, cache_di
             trust_remote_code=True
         )
         
+        # 确保tokenizer有pad_token，避免警告
+        if tokenizer.pad_token is None:
+            if tokenizer.eos_token is not None:
+                tokenizer.pad_token = tokenizer.eos_token
+                add_evaluation_log(task_id, "设置pad_token为eos_token")
+            else:
+                tokenizer.pad_token = tokenizer.unk_token or "[PAD]"
+                add_evaluation_log(task_id, "设置pad_token为unk_token或默认值")
+        
+        add_evaluation_log(task_id, f"分词器配置: pad_token={tokenizer.pad_token}, eos_token={tokenizer.eos_token}")
+        
         # 格式化MMLU问题
-        def format_mmlu_question(example):
+        def format_mmlu_question(example, use_structured_output=False):
             options = ["A", "B", "C", "D"]
-            # 使用英文提示词
-            prompt = f"The following is a multiple-choice question. Please read carefully and select the correct answer.\n\nQuestion: {example['question']}\n\n"
             
-            # 清晰地呈现选项
-            for i, option in enumerate(options):
-                if i < len(example["choices"]):
-                    prompt += f"{option}. {example['choices'][i]}\n"
+            if use_structured_output:
+                # 使用JSON Schema格式的prompt，用于结构化输出
+                prompt = f"""以下是一道单选题，你必须从4个选项中选择1个正确答案。
+
+问题：{example['question']}
+
+选项：
+"""
+                for i, option in enumerate(options):
+                    if i < len(example["choices"]):
+                        prompt += f"{option}. {example['choices'][i]}\n"
+                
+                prompt += """
+重要说明：
+1. 这是单选题，只能选择一个答案
+2. 即使选项内容包含多个数字或项目（如"1,2,3"），你仍然只能选择一个选项字母
+3. 你必须且只能回答选项字母 A、B、C 或 D 中的一个
+4. 不要包含任何解释、推理或额外文本
+5. 输出格式必须严格遵循以下JSON格式：
+
+{"answer": "A"}  或  {"answer": "B"}  或  {"answer": "C"}  或  {"answer": "D"}
+
+请直接输出JSON格式的答案："""
+            else:
+                # 强化的标准prompt
+                prompt = f"""以下是一道单选题，你必须从4个选项中选择1个正确答案。
+
+问题：{example['question']}
+
+选项：
+"""
+                for i, option in enumerate(options):
+                    if i < len(example["choices"]):
+                        prompt += f"{option}. {example['choices'][i]}\n"
+                
+                prompt += """
+重要说明：
+- 这是单选题，只能选择一个答案
+- 即使选项内容包含多个数字或项目（如"1,2,3"），你仍然只能选择一个选项字母
+- 你必须且只能回答：A、B、C、D 中的一个字母
+- 严禁输出任何解释、推理、分析或额外文字
+- 严禁输出完整选项内容或选项中的数字组合
+- 严禁使用"答案是"、"我选择"、"正确答案是"等前缀
+- 你的回答必须是且仅仅是单个字母：A 或 B 或 C 或 D
+
+答案："""
             
-            # 更明确的英文指导
-            prompt += "\nPlease select the most appropriate answer from options A, B, C, or D.\n"
-            prompt += "Your answer should only contain the option letter, for example: A or B or C or D.\n"
-            prompt += "Answer: "
             return prompt
         
         # 辅助函数：生成答案
-        def generate_answer(prompt, max_new_tokens=None):
+        def generate_answer(prompt, max_new_tokens=None, use_structured_output=False, use_vllm=False):
             if max_new_tokens is None:
-                max_new_tokens = config.get("max_new_tokens", 32)
+                max_new_tokens = config.get("max_new_tokens", 16 if use_structured_output else 32)
                 
             # 减少冗余日志输出，不再显示提示词内容
             add_evaluation_log(task_id, "正在生成答案...", "DEBUG")
             
+            def remove_think_tags(text):
+                """移除<think>标签及其内容，以及非标签的思考文本，只保留正文答案"""
+                import re
+                
+                # 检查是否包含各种思考标签和思考短语
+                think_indicators = ['<think>', '<thinking>', '<thought>', '## 思考过程', '### 思考', 'let me think', 'let me consider', 'thinking about']
+                has_think_content = any(indicator in text.lower() for indicator in think_indicators)
+                
+                if has_think_content:
+                    add_evaluation_log(task_id, "检测到思考标签，正在移除思考内容...", "DEBUG")
+                    
+                    # 统计各种思考内容的长度（用于调试）
+                    all_think_matches = []
+                    check_patterns = [
+                        r'<think>.*?</think>',
+                        r'<thinking>.*?</thinking>',
+                        r'<thought>.*?</thought>',
+                        r'## 思考过程.*?(?=##|$)',
+                        r'### 思考.*?(?=###|$)',
+                    ]
+                    
+                    for pattern in check_patterns:
+                        matches = re.findall(pattern, text, flags=re.DOTALL | re.IGNORECASE | re.MULTILINE)
+                        all_think_matches.extend(matches)
+                    
+                    if all_think_matches:
+                        total_think_length = sum(len(match) for match in all_think_matches)
+                        add_evaluation_log(task_id, f"发现 {len(all_think_matches)} 个思考标签，总长度: {total_think_length} 字符", "DEBUG")
+                    
+                    # 移除各种思考标签格式及其内容（支持多行）
+                    patterns = [
+                        r'<think>.*?</think>',           # 标准格式
+                        r'<thinking>.*?</thinking>',     # thinking标签
+                        r'<thought>.*?</thought>',       # thought标签
+                        r'## 思考过程.*?(?=##|$)',       # Markdown格式的思考部分
+                        r'### 思考.*?(?=###|$)',         # 三级标题的思考部分
+                        r'\n\n.*?let me think.*?(?=\n|$)',  # 移除"Let me think..."开始的段落
+                        r'\n\n.*?let me consider.*?(?=\n|$)',  # 移除"Let me consider..."开始的段落
+                        r'\n\n.*?thinking about.*?(?=\n|$)',   # 移除"Thinking about..."开始的段落
+                    ]
+                    
+                    cleaned_text = text
+                    for pattern in patterns:
+                        cleaned_text = re.sub(pattern, '', cleaned_text, flags=re.DOTALL | re.IGNORECASE | re.MULTILINE)
+                    
+                    # 清理多余的空白字符
+                    cleaned_text = re.sub(r'\n\s*\n', '\n', cleaned_text)
+                    cleaned_text = cleaned_text.strip()
+                    
+                    add_evaluation_log(task_id, f"思考内容移除完成，原长度: {len(text)}, 处理后长度: {len(cleaned_text)}", "DEBUG")
+                    return cleaned_text
+                else:
+                    # 没有思考标签，直接返回原文本
+                    return text.strip()
+            
             try:
-                # 准备输入
-                inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+                # 准备输入，添加attention_mask以避免警告
+                inputs = tokenizer(
+                    prompt, 
+                    return_tensors="pt", 
+                    padding=True, 
+                    truncation=True,
+                    max_length=2048
+                ).to(model.device)
                 
                 # 准备生成参数
                 generation_params = {}
                 
-                # 如果配置了使用模型自带参数，则优先使用模型推荐的参数
-                if config.get("use_default_model_params", True) and hasattr(model, "generation_config"):
+                # 添加attention_mask到生成参数
+                base_params = {
+                    "input_ids": inputs.input_ids,
+                    "attention_mask": inputs.attention_mask,
+                    "max_new_tokens": max_new_tokens,
+                    "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id,
+                    "eos_token_id": tokenizer.eos_token_id
+                }
+                
+                # 如果使用结构化输出，添加约束解码参数
+                if use_structured_output:
+                    # 为结构化输出添加约束
+                    add_evaluation_log(task_id, "使用结构化输出约束", "DEBUG")
+                    
+                    # 定义允许的输出模式（JSON格式的选项）
+                    valid_responses = [
+                        '{"answer": "A"}',
+                        '{"answer": "B"}', 
+                        '{"answer": "C"}',
+                        '{"answer": "D"}'
+                    ]
+                    
+                    # 使用更严格的生成参数
+                    generation_params = {
+                        **base_params,
+                        "do_sample": False,  # 禁用采样，使用贪婪解码
+                        "temperature": 0.01,  # 极低温度
+                        "top_p": 0.1,  # 极严格的核采样
+                        "repetition_penalty": 1.0,  # 禁用重复惩罚以避免干扰
+                        "early_stopping": True,
+                    }
+                    
+                    # 尝试使用logits processor进行约束（如果支持的话）
+                    try:
+                        from transformers import LogitsProcessorList
+                        # 这里可以添加自定义的logits processor来约束输出
+                        generation_params["logits_processor"] = LogitsProcessorList([])
+                    except ImportError:
+                        pass
+                    
+                elif use_vllm:
+                    # vLLM特定的参数
+                    add_evaluation_log(task_id, "使用vLLM引擎生成", "DEBUG")
+                    generation_params = {
+                        **base_params,
+                        "do_sample": False,
+                        "temperature": 0.0,
+                        "max_tokens": max_new_tokens,
+                    }
+                    
+                    # 如果使用结构化输出，添加guided generation参数
+                    if use_structured_output:
+                        # vLLM的guided JSON Schema定义
+                        guided_json_schema = {
+                            "type": "object",
+                            "properties": {
+                                "answer": {
+                                    "type": "string", 
+                                    "enum": ["A", "B", "C", "D"],
+                                    "description": "单选题答案，必须是A、B、C、D中的一个"
+                                }
+                            },
+                            "required": ["answer"],
+                            "additionalProperties": False
+                        }
+                        generation_params["guided_json"] = guided_json_schema
+                        add_evaluation_log(task_id, f"启用vLLM guided generation: {guided_json_schema}", "DEBUG")
+                    
+                elif config.get("use_default_model_params", True) and hasattr(model, "generation_config"):
                     add_evaluation_log(task_id, "使用模型自带参数进行生成", "DEBUG")
-                    # 只添加必要参数，其他使用模型默认值
-                    generation_params["input_ids"] = inputs.input_ids
-                    generation_params["max_new_tokens"] = max_new_tokens
+                    generation_params = base_params.copy()
                     # 可以选择性覆盖某些参数
                     if "temperature" in config:
                         generation_params["temperature"] = config.get("temperature")
@@ -500,8 +744,7 @@ def run_mmlu_evaluation(task_id: int, model_path: str, output_dir: str, cache_di
                     # 使用自定义的参数配置
                     add_evaluation_log(task_id, "使用自定义参数进行生成", "DEBUG")
                     generation_params = {
-                        "input_ids": inputs.input_ids,
-                        "max_new_tokens": max_new_tokens,
+                        **base_params,
                         **config.get("generation_params", {})
                     }
                 
@@ -511,6 +754,29 @@ def run_mmlu_evaluation(task_id: int, model_path: str, output_dir: str, cache_di
                 
                 # 解码输出
                 response = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+                
+                # 移除<think>标签内容，只保留正文答案
+                response = remove_think_tags(response)
+                
+                # 额外清理非标签思考内容
+                def clean_think_phrases(text):
+                    """移除非标签的思考短语，提取第一行作为答案"""
+                    lines = text.split('\n')
+                    if lines:
+                        first_line = lines[0].strip()
+                        # 如果第一行包含思考短语，尝试从后续行找答案
+                        if any(phrase in first_line.lower() for phrase in ['let me think', 'let me consider', 'thinking about']):
+                            # 查找非思考的行
+                            for line in lines[1:]:
+                                clean_line = line.strip()
+                                if clean_line and not any(phrase in clean_line.lower() for phrase in ['let me think', 'let me consider', 'thinking about']):
+                                    return clean_line
+                            return first_line  # 如果没找到，返回第一行
+                        else:
+                            return first_line
+                    return text
+                
+                response = clean_think_phrases(response)
                 
                 # 过滤掉异常响应（全是分号或重复字符）
                 response = response.strip()
@@ -539,6 +805,36 @@ def run_mmlu_evaluation(task_id: int, model_path: str, output_dir: str, cache_di
                     # 不再使用随机选择
                     add_evaluation_log(task_id, f"检测到异常回答，标记为未知", "WARNING")
                     return "未知"
+                
+                # 处理结构化输出的JSON解析
+                if use_structured_output:
+                    try:
+                        # 尝试解析JSON格式的回答
+                        import json
+                        import re
+                        
+                        # 清理response，去除可能的前后缀
+                        clean_response = response.strip()
+                        
+                        # 尝试找到JSON部分
+                        json_match = re.search(r'\{[^}]*"answer"\s*:\s*"([ABCD])"\s*[^}]*\}', clean_response)
+                        if json_match:
+                            extracted_answer = json_match.group(1)
+                            add_evaluation_log(task_id, f"成功解析结构化输出: {extracted_answer}", "INFO")
+                            return extracted_answer
+                        
+                        # 如果找不到完整JSON，尝试解析部分JSON
+                        answer_match = re.search(r'"answer"\s*:\s*"([ABCD])"', clean_response)
+                        if answer_match:
+                            extracted_answer = answer_match.group(1)
+                            add_evaluation_log(task_id, f"从部分JSON解析答案: {extracted_answer}", "INFO")
+                            return extracted_answer
+                        
+                        # 如果JSON解析失败，记录原始回答并回退到常规解析
+                        add_evaluation_log(task_id, f"JSON解析失败，原始回答: '{clean_response}'，回退到常规解析", "WARNING")
+                        
+                    except Exception as e:
+                        add_evaluation_log(task_id, f"结构化输出解析异常: {str(e)}", "WARNING")
                 
                 # 打印完整回答用于调试
                 add_evaluation_log(task_id, f"模型回答：{response}", "INFO")
@@ -600,6 +896,11 @@ def run_mmlu_evaluation(task_id: int, model_path: str, output_dir: str, cache_di
         add_evaluation_log(task_id, f"将评估 {max_subjects} 个科目: {', '.join(subjects_to_evaluate)}")
         
         for subject_idx, subject in enumerate(subjects_to_evaluate):
+            # 检查任务是否被停止
+            if task_id not in running_evaluations:
+                add_evaluation_log(task_id, f"评估任务在科目 '{subject}' 开始前被停止", "INFO")
+                return False, "评估任务已被用户停止"
+            
             add_evaluation_log(task_id, f"开始评估科目 ({subject_idx+1}/{max_subjects}): {subject}")
             test_data = test_datasets[subject]
             
@@ -625,6 +926,11 @@ def run_mmlu_evaluation(task_id: int, model_path: str, output_dir: str, cache_di
                 errors_count = 0
                 
                 for i, example in enumerate(test_data):
+                    # 检查任务是否被停止
+                    if task_id not in running_evaluations:
+                        add_evaluation_log(task_id, f"评估任务在科目 '{subject}' 的第 {i+1} 个样本时被停止", "INFO")
+                        return False, "评估任务已被用户停止"
+                    
                     # 每个样本都有独立的异常处理
                     try:
                         # 检查样本格式
@@ -640,24 +946,60 @@ def run_mmlu_evaluation(task_id: int, model_path: str, output_dir: str, cache_di
                             add_evaluation_log(task_id, f"样本 {i+1} 的答案 {example['answer']} 不合法，跳过", "WARNING")
                             continue
                         
+                        # 从配置中获取结构化输出和vLLM设置
+                        use_structured_output = config.get("use_structured_output", False)
+                        use_vllm = config.get("use_vllm", False)
+                        
                         # 格式化问题
-                        prompt = format_mmlu_question(example)
+                        prompt = format_mmlu_question(example, use_structured_output=use_structured_output)
                         
                         # 生成答案
                         start_time = time.time()
                         add_evaluation_log(task_id, f"问题：{prompt[:100]}...", "INFO")
-                        model_answer = generate_answer(prompt)
+                        model_answer = generate_answer(prompt, use_structured_output=use_structured_output, use_vllm=use_vllm)
                         end_time = time.time()
                         
-                        # 改进提取选项字母的逻辑
+                        # 改进提取选项字母的逻辑，包括内容匹配
                         model_choice = ""
                         
-                        # 首先尝试直接从开头获取单个字母答案（最理想情况）
-                        first_char = model_answer.strip()[0:1] if model_answer.strip() else ""
-                        if first_char in "ABCD":
-                            model_choice = first_char
-                            add_evaluation_log(task_id, f"直接提取到选项: {model_choice}", "INFO")
+                        # 如果使用结构化输出，model_answer应该已经是单个字母
+                        if use_structured_output and model_answer.strip() in "ABCD":
+                            model_choice = model_answer.strip()
+                            add_evaluation_log(task_id, f"结构化输出直接获取: {model_choice}", "INFO")
                         else:
+                            # 首先尝试直接从开头获取单个字母答案（最理想情况）
+                            first_char = model_answer.strip()[0:1] if model_answer.strip() else ""
+                            if first_char in "ABCD":
+                                model_choice = first_char
+                                add_evaluation_log(task_id, f"直接提取到选项: {model_choice}", "INFO")
+                            else:
+                                # 检查是否模型输出了数字组合（错误行为）
+                                model_answer_clean = model_answer.strip()
+                                
+                                # 如果模型回答了数字组合（如"1,2,3"），则标记为错误
+                                if re.search(r'^\d+([,，]\d+)*$', model_answer_clean):
+                                    add_evaluation_log(task_id, f"检测到数字组合回答: '{model_answer_clean}'，这是错误的，应该回答选项字母", "WARNING")
+                                    model_choice = "未知"
+                                else:
+                                    # 尝试通过选项内容匹配（但要小心数字组合的情况）
+                                    model_answer_lower = model_answer_clean.lower()
+                                    for i, choice in enumerate(example["choices"]):
+                                        choice_clean = str(choice).strip().lower()
+                                        # 只有当选项不是纯数字组合时才进行内容匹配
+                                        if not re.search(r'^\d+([,，]\d+)*$', choice_clean):
+                                            if (choice_clean == model_answer_lower or 
+                                                model_answer_lower.startswith(choice_clean) or
+                                                choice_clean in model_answer_lower):
+                                                model_choice = "ABCD"[i]
+                                                add_evaluation_log(task_id, f"通过选项内容匹配到: {model_choice} (匹配内容: {choice})", "INFO")
+                                                break
+                                    
+                                    # 如果内容匹配失败，记录调试信息
+                                    if not model_choice:
+                                        add_evaluation_log(task_id, f"内容匹配失败 - 模型回答: '{model_answer}', 选项: {example['choices']}", "DEBUG")
+                        
+                        # 如果还没找到，继续原有的字母匹配逻辑
+                        if not model_choice:
                             # 1. 先查找形如"答案：X"的模式
                             answer_format = re.search(r'答案[：:]\s*([A-D])', model_answer)
                             if answer_format:
@@ -857,10 +1199,12 @@ def run_mmlu_evaluation(task_id: int, model_path: str, output_dir: str, cache_di
                     add_evaluation_log(task_id, f"科目 '{subject}' 准确率: {value:.4f}")
             
             # 更新任务指标 - 使用经过序列化处理的字典形式
+            add_evaluation_log(task_id, f"正在保存指标数据: {json.dumps(metrics_dict, ensure_ascii=False)[:200]}...", "DEBUG")
             update_evaluation_task(
                 task_id=task_id,
-                metrics_dict=metrics_dict  # 直接使用序列化后的字典
+                metrics=metrics_dict  # 修正参数名为metrics
             )
+            add_evaluation_log(task_id, "指标数据已成功保存到数据库", "INFO")
         except Exception as e:
             add_evaluation_log(task_id, f"解析指标失败: {str(e)}", "ERROR")
             import traceback
@@ -885,6 +1229,11 @@ def run_evaluation(task_id: int):
         logger.error(f"评估任务不存在: {task_id}")
         return
     
+    # 检查任务是否已被标记为停止
+    if task_id not in running_evaluations:
+        logger.warning(f"评估任务 {task_id} 在启动前已被停止")
+        return
+    
     # 更新任务状态为"运行中"
     task = update_evaluation_task(
         task_id=task_id,
@@ -892,8 +1241,10 @@ def run_evaluation(task_id: int):
         started_at=datetime.now()
     )
     
-    # 将任务添加到运行中的任务字典
-    running_evaluations[task_id] = True
+    # 确认任务仍在运行列表中
+    if task_id not in running_evaluations:
+        logger.warning(f"评估任务 {task_id} 在状态更新后被停止")
+        return
     
     try:
         # 记录开始信息
@@ -942,6 +1293,7 @@ def run_evaluation(task_id: int):
         
         # 使用Hugging Face评估
         add_evaluation_log(task_id, f"使用Hugging Face进行{evaluation_method}评估...")
+        add_evaluation_log(task_id, "评估功能已支持思考模型适配，将自动移除<think>标签内的思考内容，只评估最终答案")
         success, result_or_error = run_huggingface_evaluation(
             task_id, 
             model_path, 
@@ -993,16 +1345,24 @@ def start_evaluation(task_id: int):
     """
     在后台启动评估任务
     """
-    threading.Thread(target=run_evaluation, args=(task_id,), daemon=True).start()
+    logger.info(f"启动评估任务线程: {task_id}")
+    thread = threading.Thread(target=run_evaluation, args=(task_id,), daemon=True)
+    thread.start()
+    logger.info(f"评估任务线程已启动: {task_id}, 线程ID: {thread.ident}")
 
 def stop_evaluation(task_id: int) -> bool:
     """
     停止正在运行的评估任务
     """
+    logger.info(f"尝试停止评估任务: {task_id}")
     if task_id in running_evaluations:
         del running_evaluations[task_id]
+        logger.info(f"评估任务 {task_id} 已标记为停止")
+        add_evaluation_log(task_id, "评估任务已被用户停止", "INFO")
         return True
-    return False
+    else:
+        logger.warning(f"评估任务 {task_id} 不在运行列表中，可能已经停止或未启动")
+        return False
 
 def delete_evaluation_task_config(task_id: int) -> bool:
     """
@@ -1058,18 +1418,22 @@ def add_evaluation_log(task_id: int, content: str, level: str = "INFO"):
     try:
         from main import send_evaluation_log
         
-        # 使用asyncio运行异步函数
+        # 简化异步调用，使用线程池处理
         import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            # 如果没有事件循环，则创建一个新的
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        import threading
         
-        # 使用事件循环的run_in_executor来在后台运行
-        # 使用自定义的JSON序列化函数处理特殊类型
-        loop.run_in_executor(None, lambda: asyncio.run(send_evaluation_log(task_id, json.dumps(log_entry, default=json_serializer))))
+        def send_ws_log():
+            try:
+                # 创建新的事件循环并运行
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(send_evaluation_log(task_id, json.dumps(log_entry, default=json_serializer)))
+                loop.close()
+            except Exception as e:
+                logger.error(f"WebSocket发送失败: {str(e)}")
+        
+        # 在单独线程中执行异步操作
+        threading.Thread(target=send_ws_log, daemon=True).start()
     except Exception as e:
         logger.error(f"WebSocket评估日志异常: {str(e)}")
 

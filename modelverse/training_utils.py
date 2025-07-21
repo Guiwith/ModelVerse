@@ -772,8 +772,16 @@ async def broadcast_resource_update(message: dict):
             from database import get_resource
             resource = get_resource(message["resource_id"])
             if resource:
-                # 使用完整的资源对象
-                message["resource"] = resource.dict()
+                # 使用完整的资源对象，处理datetime序列化问题
+                resource_dict = resource.dict()
+                # 转换datetime字段为字符串，避免JSON序列化错误
+                for field in ["created_at", "updated_at", "started_at", "completed_at"]:
+                    if field in resource_dict and resource_dict[field]:
+                        if hasattr(resource_dict[field], 'isoformat'):
+                            resource_dict[field] = resource_dict[field].isoformat()
+                        else:
+                            resource_dict[field] = str(resource_dict[field])
+                message["resource"] = resource_dict
                 
                 # 保持向后兼容
                 if "status" not in message and "status" in message["resource"]:
