@@ -1,0 +1,14 @@
+fastapi==0.104.1
+uvicorn[standard]
+pydantic==2.4.2
+python-jose[cryptography]==3.3.0
+passlib==1.7.4
+python-multipart==0.0.6
+bcrypt==4.0.1
+Pillow
+huggingface_hub>=0.17.0 
+websocket
+oumi[gpu]
+PyYAML
+hf_transfer
+hf_xet
