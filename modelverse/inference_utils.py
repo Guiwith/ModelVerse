@@ -554,12 +554,26 @@ async def start_inference_service(task_id: int) -> bool:
         while tries < max_tries:
             # 检查进程是否仍在运行
             if process.returncode is not None:
+                # 尝试读取日志文件获取错误信息
+                log_excerpt = ""
+                try:
+                    with open(log_file, 'r') as f:
+                        last_lines = f.readlines()[-30:]  # 获取最后30行
+                        log_excerpt = ''.join(last_lines)
+                except Exception as e:
+                    log_excerpt = f"无法读取日志文件: {str(e)}"
+                
                 error_msg = f"推理服务进程已终止: 退出码={process.returncode}"
-                logger.error(error_msg)
+                if log_excerpt:
+                    full_error_msg = f"{error_msg}\n\n最近的日志信息:\n{log_excerpt}"
+                else:
+                    full_error_msg = error_msg
+                    
+                logger.error(f"{error_msg}\n日志摘要:\n{log_excerpt}")
                 update_inference_task(
                     task_id=task_id,
                     status=InferenceStatus.FAILED,
-                    error_message=error_msg
+                    error_message=full_error_msg
                 )
                 active_processes.remove(process_info)
                 return False
@@ -590,6 +604,7 @@ async def start_inference_service(task_id: int) -> bool:
             tries += 1
         
         # 尝试检查进程日志
+        log_excerpt = ""
         try:
             with open(log_file, 'r') as f:
                 last_lines = f.readlines()[-20:]  # 获取最后20行
@@ -597,14 +612,20 @@ async def start_inference_service(task_id: int) -> bool:
                 logger.error(f"推理服务日志摘要:\n{log_excerpt}")
         except Exception as e:
             logger.error(f"无法读取推理服务日志: {str(e)}")
+            log_excerpt = f"无法读取日志文件: {str(e)}"
         
         # 如果服务未能启动，标记为失败
-        error_msg = "推理服务启动超时"
+        error_msg = f"推理服务启动超时（等待了{max_tries * 5}秒）"
+        if log_excerpt:
+            full_error_msg = f"{error_msg}\n\n最近的日志信息:\n{log_excerpt}"
+        else:
+            full_error_msg = error_msg
+            
         logger.error(f"{error_msg}: 任务={task_id}")
         update_inference_task(
             task_id=task_id,
             status=InferenceStatus.FAILED,
-            error_message=error_msg
+            error_message=full_error_msg
         )
         
         # 尝试终止进程
@@ -619,12 +640,17 @@ async def start_inference_service(task_id: int) -> bool:
         return False
         
     except Exception as e:
+        import traceback
         error_msg = f"启动推理服务失败: {str(e)}"
-        logger.error(error_msg)
+        error_details = traceback.format_exc()
+        logger.error(f"{error_msg}\n详细错误信息:\n{error_details}")
+        
+        # 将详细错误信息存储到数据库
+        full_error_msg = f"{error_msg}\n\n详细错误信息:\n{error_details}"
         update_inference_task(
             task_id=task_id,
             status=InferenceStatus.FAILED,
-            error_message=error_msg
+            error_message=full_error_msg
         )
         return False
 
@@ -858,4 +884,4 @@ def cleanup_inference_files(task_id: int) -> dict:
     except Exception as e:
         result["success"] = False
         result["errors"].append(f"清理过程中发生错误: {str(e)}")
-        return result 
+        return result

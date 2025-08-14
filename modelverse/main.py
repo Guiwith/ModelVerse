@@ -1327,11 +1327,26 @@ async def start_inference_task(
             status=InferenceStatus.CREATING
         )
         
-        # 在后台启动推理服务
-        background_tasks.add_task(inference_utils.start_inference_service, task_id)
+        # 尝试同步启动推理服务，以便能够捕获启动过程中的错误
+        try:
+            # 启动推理服务
+            start_result = await inference_utils.start_inference_service(task_id)
+            if start_result:
+                logger.info(f"推理任务启动成功: {task_id}")
+                return {"message": "推理任务启动成功"}
+            else:
+                # 获取任务的错误信息
+                updated_task = get_inference_task(task_id=task_id)
+                error_msg = updated_task.error_message if updated_task and updated_task.error_message else "推理任务启动失败，原因未知"
+                logger.error(f"推理任务启动失败: {task_id}, 错误: {error_msg}")
+                raise HTTPException(status_code=500, detail=error_msg)
+        except Exception as start_error:
+            # 获取任务的错误信息
+            updated_task = get_inference_task(task_id=task_id)
+            error_msg = updated_task.error_message if updated_task and updated_task.error_message else str(start_error)
+            logger.error(f"推理任务启动过程中发生异常: {task_id}, 错误: {error_msg}")
+            raise HTTPException(status_code=500, detail=f"推理任务启动失败: {error_msg}")
         
-        logger.info(f"推理任务正在启动: {task_id}")
-        return {"message": "推理任务正在启动"}
     except HTTPException:
         raise
     except Exception as e:
@@ -2419,4 +2434,4 @@ if __name__ == "__main__":
         logging.warning(f"无法检查huggingface_hub版本: {str(e)}")
     
     # 启动服务
-    uvicorn.run(app, host="0.0.0.0", port=8888) 
+    uvicorn.run(app, host="0.0.0.0", port=8888)

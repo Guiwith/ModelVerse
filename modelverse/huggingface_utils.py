@@ -14,16 +14,67 @@ import importlib.metadata
 import subprocess
 import json
 import shutil
+import requests
 from typing import Dict, Optional, Any, Tuple
 import re
 from urllib.parse import urlparse
 
-# 设置镜像站配置 - 统一使用hf-mirror.com作为镜像站
-mirror_url = "https://hf-mirror.com"
+def test_network_connectivity(url: str, timeout: int = 20) -> bool:
+    """测试网络连通性"""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(url, timeout=timeout, allow_redirects=True, headers=headers)
+        return response.status_code == 200
+    except Exception as e:
+        print(f"连接测试失败 {url}: {str(e)}")
+        return False
 
-# 强制设置环境变量
-os.environ["HF_ENDPOINT"] = mirror_url
-os.environ["HF_MIRROR"] = mirror_url  # 兼容某些旧版本
+def get_best_endpoint() -> Tuple[str, bool]:
+    """获取最佳的端点URL，返回(url, is_mirror)"""
+    # 官方地址
+    official_url = "https://huggingface.co"
+    # 镜像站地址
+    mirror_url = "https://hf-mirror.com"
+    
+    print("正在测试网络连通性...")
+    
+    # 首先测试镜像站（对国内用户更快）
+    if test_network_connectivity(mirror_url):
+        print(f"镜像站连通性测试成功: {mirror_url}")
+        return mirror_url, True
+    
+    # 如果镜像站不通，测试官方站点
+    if test_network_connectivity(official_url):
+        print(f"官方站点连通性测试成功: {official_url}")
+        return official_url, False
+    
+    # 如果都不通，默认使用镜像站（可能是网络问题）
+    print("所有站点连通性测试都失败，默认使用镜像站")
+    return mirror_url, True
+
+def retest_connectivity_and_adjust() -> Tuple[str, bool]:
+    """重新测试连通性并调整策略"""
+    logger.info("重新测试网络连通性...")
+    new_endpoint, new_is_mirror = get_best_endpoint()
+    
+    # 更新环境变量
+    os.environ["HF_ENDPOINT"] = new_endpoint
+    if new_is_mirror:
+        os.environ["HF_MIRROR"] = new_endpoint
+    
+    logger.info(f"连通性重测结果: {new_endpoint} ({'镜像站' if new_is_mirror else '官方站'})")
+    return new_endpoint, new_is_mirror
+
+# 动态选择最佳端点
+best_endpoint, is_using_mirror = get_best_endpoint()
+print(f"选择的端点: {best_endpoint} ({'镜像站' if is_using_mirror else '官方站'})")
+
+# 设置环境变量
+os.environ["HF_ENDPOINT"] = best_endpoint
+if is_using_mirror:
+    os.environ["HF_MIRROR"] = best_endpoint  # 兼容某些旧版本
 
 # 禁用hf_transfer，它可能会绕过镜像站
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
@@ -38,7 +89,8 @@ os.environ["HF_HOME"] = cache_home
 os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.join(cache_home, "hub")
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+# 启用进度条以便监控下载进度
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
 
 # 为Unix系统设置临时目录
 if platform.system() != "Windows":
@@ -53,18 +105,17 @@ if platform.system() != "Windows":
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("huggingface_utils")
 
-# 记录当前使用的镜像站
-logger.info(f"当前使用的HuggingFace镜像站: {mirror_url}")
+# 记录当前使用的端点
+logger.info(f"当前使用的HuggingFace端点: {best_endpoint}")
 
 # 导入huggingface_hub并配置镜像站
 from huggingface_hub import hf_hub_download, snapshot_download, HfApi
 
-# 强制使用镜像站(在库导入后)
+# 强制使用选定的端点(在库导入后)
 try:
-   
-    logger.info(f"使用环境变量配置镜像站: {mirror_url}")
+    logger.info(f"使用环境变量配置端点: {best_endpoint}")
 except (ImportError, AttributeError):
-    logger.warning("无法配置镜像站，将依赖环境变量")
+    logger.warning("无法配置端点，将依赖环境变量")
 
 
 try:
@@ -73,17 +124,19 @@ try:
     original_endpoint = getattr(hf_constants, "ENDPOINT", "unknown")
     # 设置新的端点
     if hasattr(hf_constants, "ENDPOINT"):
-        setattr(hf_constants, "ENDPOINT", mirror_url)
-        logger.info(f"已修改huggingface_hub.constants.ENDPOINT: {original_endpoint} -> {mirror_url}")
+        setattr(hf_constants, "ENDPOINT", best_endpoint)
+        logger.info(f"已修改huggingface_hub.constants.ENDPOINT: {original_endpoint} -> {best_endpoint}")
     
-    # 检查其他可能的URL常量
-    for attr_name in dir(hf_constants):
-        if attr_name.endswith("_URL") or "ENDPOINT" in attr_name:
-            attr_value = getattr(hf_constants, attr_name, None)
-            if attr_value and isinstance(attr_value, str) and "huggingface.co" in attr_value:
-                new_value = attr_value.replace("huggingface.co", mirror_url.replace("https://", ""))
-                setattr(hf_constants, attr_name, new_value)
-                logger.info(f"已修改huggingface_hub常量 {attr_name}: {attr_value} -> {new_value}")
+    # 只有在使用镜像站时才替换URL常量
+    if is_using_mirror:
+        # 检查其他可能的URL常量
+        for attr_name in dir(hf_constants):
+            if attr_name.endswith("_URL") or "ENDPOINT" in attr_name:
+                attr_value = getattr(hf_constants, attr_name, None)
+                if attr_value and isinstance(attr_value, str) and "huggingface.co" in attr_value:
+                    new_value = attr_value.replace("huggingface.co", best_endpoint.replace("https://", ""))
+                    setattr(hf_constants, attr_name, new_value)
+                    logger.info(f"已修改huggingface_hub常量 {attr_name}: {attr_value} -> {new_value}")
 except Exception as e:
     logger.warning(f"修改huggingface_hub常量时出错: {str(e)}")
 
@@ -95,19 +148,19 @@ _active_downloads: Dict[int, Dict[str, Any]] = {}
 _download_threads: Dict[int, threading.Thread] = {}
 _stop_events: Dict[int, threading.Event] = {}
 
-# 镜像源配置
+# 镜像源配置 - 根据连通性测试结果动态配置
 MIRRORS = {
-    MirrorSource.OFFICIAL: mirror_url,  # 改为默认使用镜像站
+    MirrorSource.OFFICIAL: "https://huggingface.co",
     MirrorSource.MODELSCOPE: "https://modelscope.cn/huggingface",  
-    MirrorSource.MIRROR_CN: mirror_url
+    MirrorSource.MIRROR_CN: "https://hf-mirror.com"
 }
 
 # 本地存储配置
 DEFAULT_MODEL_DIR = os.environ.get("MODEL_DIR", "./models")
 DEFAULT_DATASET_DIR = os.environ.get("DATASET_DIR", "./datasets")
 
-# 默认使用中国镜像站
-DEFAULT_MIRROR_SOURCE = MirrorSource.MIRROR_CN
+# 根据连通性测试结果选择默认镜像源
+DEFAULT_MIRROR_SOURCE = MirrorSource.MIRROR_CN if is_using_mirror else MirrorSource.OFFICIAL
 
 def _get_save_dir(resource: Resource) -> str:
     """根据资源类型获取保存目录"""
@@ -151,15 +204,19 @@ def download_with_cli(repo_id: str, repo_type: str, save_dir: str, mirror_url: s
                 
                 logger.info(f"下载文件 ({idx+1}/{len(files)}): {file_info.rfilename}")
                 try:
+                    # 显示下载进度
+                    progress_percent = ((idx + 1) / len(files)) * 100
+                    logger.info(f"文件下载进度: {progress_percent:.1f}% ({idx+1}/{len(files)})")
+                    
                     hf_hub_download(
                         repo_id=repo_id,
                         filename=file_info.rfilename,
                         repo_type=repo_type,
                         local_dir=save_dir,
-                        local_dir_use_symlinks=False,
                         resume_download=True,
                         endpoint=mirror_url
                     )
+                    logger.info(f"文件下载完成: {file_info.rfilename}")
                 except Exception as e:
                     logger.warning(f"下载文件 {file_info.rfilename} 失败: {str(e)}")
             
@@ -190,19 +247,37 @@ def download_with_cli(repo_id: str, repo_type: str, save_dir: str, mirror_url: s
             ]
             
             logger.info(f"执行命令: {' '.join(cmd)}")
-            result = subprocess.run(
+            
+            # 使用Popen来实时获取输出
+            process = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
-                check=False,
-                env=env
+                env=env,
+                bufsize=1,
+                universal_newlines=True
             )
             
-            if result.returncode == 0:
+            # 实时读取输出
+            while True:
+                output = process.stdout.readline()
+                if output == '' and process.poll() is not None:
+                    break
+                if output:
+                    # 过滤并显示有用的进度信息
+                    output_line = output.strip()
+                    if any(keyword in output_line.lower() for keyword in ['downloading', 'progress', 'mb', 'gb', '%']):
+                        logger.info(f"CLI下载进度: {output_line}")
+                    elif 'error' in output_line.lower() or 'failed' in output_line.lower():
+                        logger.warning(f"CLI下载警告: {output_line}")
+            
+            return_code = process.poll()
+            if return_code == 0:
                 logger.info(f"huggingface-cli下载成功: {repo_id}")
                 return True
             else:
-                logger.warning(f"huggingface-cli下载失败: {result.stderr}")
+                logger.warning(f"huggingface-cli下载失败，返回码: {return_code}")
         except Exception as e:
             logger.warning(f"huggingface-cli命令执行失败: {str(e)}")
         
@@ -378,7 +453,6 @@ def safe_snapshot_download(repo_id, repo_type, save_dir, mirror_url, max_workers
             repo_id=repo_id,
             repo_type=repo_type,
             local_dir=save_dir,
-            local_dir_use_symlinks=False,
             resume_download=True,
             endpoint=mirror_url,  # 显式指定端点，不依赖环境变量
             max_workers=max_workers,
@@ -444,12 +518,17 @@ def _download_worker(resource_id: int, resource: Resource, source: MirrorSource,
         mirror_url = MIRRORS.get(source, MIRRORS[DEFAULT_MIRROR_SOURCE])
         save_dir = _get_save_dir(resource)
         
-        # 强制设置环境变量
-        os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+        # 根据镜像源类型决定下载策略
+        is_mirror_source = source in [MirrorSource.MIRROR_CN, MirrorSource.MODELSCOPE]
+        use_cli_download = (source == MirrorSource.OFFICIAL) or (not is_using_mirror and source == MirrorSource.MIRROR_CN)
+        
+        # 设置环境变量
+        os.environ["HF_ENDPOINT"] = mirror_url
         logger.info(f"设置环境变量HF_ENDPOINT={mirror_url}")
+        logger.info(f"下载策略: {'使用CLI下载' if use_cli_download else '使用镜像站API下载'}")
         
         # 开始下载
-        logger.info(f"开始下载资源: {resource.repo_id} 到 {save_dir}, 使用镜像站: {mirror_url}")
+        logger.info(f"开始下载资源: {resource.repo_id} 到 {save_dir}, 使用端点: {mirror_url}")
         
         # 初始化进度数据
         _active_downloads[resource_id] = {
@@ -475,9 +554,10 @@ def _download_worker(resource_id: int, resource: Resource, source: MirrorSource,
             last_count = 0
             unchanged_count = 0
             max_unchanged_checks = 10  # 如果连续10次（50秒）没有变化则考虑完成
+            last_check_time = time.time()
             
             while not stop_event.is_set() and not download_completed.is_set():
-                time.sleep(5)  # 每5秒检查一次
+                time.sleep(3)  # 每3秒检查一次，提高响应性
                 
                 # 检查目录是否存在及其内容
                 try:
@@ -498,11 +578,21 @@ def _download_worker(resource_id: int, resource: Resource, source: MirrorSource,
                         # 检查文件变化以判断下载进度
                         if file_count > 0:
                             size_mb = total_size / (1024 * 1024)
+                            current_time = time.time()
+                            time_diff = current_time - last_check_time
+                            
+                            # 计算下载速度
+                            if time_diff > 0 and total_size > last_size:
+                                speed_bytes_per_sec = (total_size - last_size) / time_diff
+                                speed_mb_per_sec = speed_bytes_per_sec / (1024 * 1024)
+                                logger.info(f"下载进度: {size_mb:.2f} MB, {file_count} 个文件, 速度: {speed_mb_per_sec:.2f} MB/s")
+                            else:
+                                logger.info(f"下载进度检查: {size_mb:.2f} MB, {file_count} 个文件")
                             
                             # 如果文件大小相同，可能下载停滞
                             if total_size == last_size and file_count == last_count:
                                 unchanged_count += 1
-                                if unchanged_count >= 6:  # 30秒无变化
+                                if unchanged_count >= 10:  # 30秒无变化
                                     logger.warning(f"下载可能卡住，30秒内未检测到文件变化: {size_mb:.2f} MB, {file_count} 个文件")
                                 
                                 # 检测长时间无变化 - 超过max_unchanged_checks次检查
@@ -531,19 +621,20 @@ def _download_worker(resource_id: int, resource: Resource, source: MirrorSource,
                             else:
                                 unchanged_count = 0
                                 
-                            # 更新上次大小
+                            # 更新上次大小和时间
                             last_size = total_size
                             last_count = file_count
+                            last_check_time = current_time
                             
-                            logger.info(f"下载进度检查: {size_mb:.2f} MB, {file_count} 个文件")
-                            
-                            # 进度设置为0.5 - 表示正在下载中但尚未完成
-                            if _active_downloads[resource_id]["progress"] < 0.5:
-                                _active_downloads[resource_id]["progress"] = 0.5
+                            # 动态更新进度 - 基于文件大小变化
+                            if total_size > 0:
+                                # 估算进度，最小50%，最大95%
+                                estimated_progress = min(0.95, max(0.5, 0.5 + (total_size / (100 * 1024 * 1024)) * 0.4))
+                                _active_downloads[resource_id]["progress"] = estimated_progress
                                 update_resource_status(
                                     resource_id=resource_id,
                                     status=DownloadStatus.DOWNLOADING,
-                                    progress=0.5
+                                    progress=estimated_progress * 100
                                 )
                 except Exception as e:
                     logger.warning(f"检查下载进度时出错: {str(e)}")
@@ -562,18 +653,22 @@ def _download_worker(resource_id: int, resource: Resource, source: MirrorSource,
             if resource.resource_type == ResourceType.MODEL:
                 # 获取模型快照（下载整个仓库）
                 try:
-                    # 首先尝试使用命令行方式下载
-                    logger.info(f"首先尝试使用命令行方式下载模型 {resource.repo_id}")
-                    if download_with_cli(
-                        repo_id=resource.repo_id,
-                        repo_type="model",
-                        save_dir=save_dir,
-                        mirror_url=mirror_url
-                    ):
-                        logger.info("命令行下载成功")
+                    if use_cli_download:
+                        # 使用命令行方式下载（适用于官方站点或无法访问镜像站时）
+                        logger.info(f"使用命令行方式下载模型 {resource.repo_id}")
+                        if download_with_cli(
+                            repo_id=resource.repo_id,
+                            repo_type="model",
+                            save_dir=save_dir,
+                            mirror_url=mirror_url
+                        ):
+                            logger.info("命令行下载成功")
+                        else:
+                            # 命令行下载失败，尝试使用API方式
+                            logger.warning("命令行下载失败，尝试API方式下载")
                     else:
-                        # 命令行下载失败，尝试使用API方式
-                        logger.warning("命令行下载失败，尝试API方式下载")
+                        # 直接使用API方式下载（适用于镜像站）
+                        logger.info(f"使用API方式下载模型 {resource.repo_id}")
                         
                         # 使用huggingface_hub直接下载
                         logger.info(f"使用huggingface_hub {importlib.metadata.version('huggingface_hub')} 版本下载模型")
@@ -599,10 +694,81 @@ def _download_worker(resource_id: int, resource: Resource, source: MirrorSource,
                                     if not os.path.exists(dir_path):
                                         os.makedirs(dir_path, exist_ok=True)
                                     
-                                    # 发送文件下载进度信息
+                                    # 获取文件大小信息（如果可用）
+                                    file_size_info = ""
+                                    if hasattr(file_info, 'size') and file_info.size:
+                                        file_size_mb = file_info.size / (1024 * 1024)
+                                        file_size_info = f" ({file_size_mb:.2f} MB)"
+                                    
+                                    logger.info(f"下载文件 ({idx+1}/{len(repo_info.siblings)}): {file_info.rfilename}{file_size_info}")
+                                    
+                                    # 记录下载开始时间
+                                    download_start_time = time.time()
+                                    
+                                    # 对于大文件，使用更详细的监控
+                                    file_size_bytes = getattr(file_info, 'size', 0)
+                                    is_large_file = file_size_bytes > 100 * 1024 * 1024  # 大于100MB认为是大文件
+                                    
+                                    if is_large_file:
+                                        logger.info(f"检测到大文件，启用详细监控: {file_info.rfilename} ({file_size_mb:.2f} MB)")
+                                        
+                                        # 创建一个线程来监控大文件下载进度
+                                        def monitor_large_file_download():
+                                            file_path = os.path.join(save_dir, file_info.rfilename)
+                                            last_size = 0
+                                            start_time = time.time()
+                                            
+                                            while True:
+                                                try:
+                                                    if os.path.exists(file_path):
+                                                        current_size = os.path.getsize(file_path)
+                                                        if current_size > last_size:
+                                                            elapsed = time.time() - start_time
+                                                            if elapsed > 0:
+                                                                speed = current_size / elapsed / (1024 * 1024)  # MB/s
+                                                                progress = (current_size / file_size_bytes) * 100 if file_size_bytes > 0 else 0
+                                                                logger.info(f"大文件下载进度: {file_info.rfilename} - {progress:.1f}% ({current_size/(1024*1024):.1f}/{file_size_mb:.1f} MB), 速度: {speed:.2f} MB/s")
+                                                            last_size = current_size
+                                                        
+                                                        # 如果文件大小达到预期，退出监控
+                                                        if file_size_bytes > 0 and current_size >= file_size_bytes:
+                                                            break
+                                                    
+                                                    time.sleep(2)  # 每2秒检查一次大文件进度
+                                                except Exception as e:
+                                                    logger.warning(f"监控大文件下载时出错: {str(e)}")
+                                                    break
+                                        
+                                        # 启动监控线程
+                                        monitor_thread = threading.Thread(target=monitor_large_file_download)
+                                        monitor_thread.daemon = True
+                                        monitor_thread.start()
+                                    
+                                    hf_hub_download(
+                                        repo_id=resource.repo_id,
+                                        filename=file_info.rfilename,
+                                        repo_type="model",
+                                        local_dir=save_dir,
+                                        resume_download=True,
+                                        endpoint=mirror_url
+                                    )
+                                    
+                                    # 记录下载完成时间和速度
+                                    download_end_time = time.time()
+                                    download_duration = download_end_time - download_start_time
+                                    if hasattr(file_info, 'size') and file_info.size and download_duration > 0:
+                                        speed_mb_s = (file_info.size / (1024 * 1024)) / download_duration
+                                        logger.info(f"文件下载完成: {file_info.rfilename}, 耗时: {download_duration:.1f}s, 速度: {speed_mb_s:.2f} MB/s")
+                                    else:
+                                        logger.info(f"文件下载完成: {file_info.rfilename}, 耗时: {download_duration:.1f}s")
+                                    
+                                    # 文件下载完成后发送进度更新
                                     try:
                                         from training_utils import broadcast_resource_update
                                         import asyncio
+                                        
+                                        # 计算实际进度百分比
+                                        progress_percent = ((idx + 1) / len(repo_info.siblings)) * 100
                                         
                                         progress_data = {
                                             "type": "resource_file_progress",
@@ -610,25 +776,23 @@ def _download_worker(resource_id: int, resource: Resource, source: MirrorSource,
                                             "file_name": file_info.rfilename,
                                             "file_index": idx + 1,
                                             "total_files": len(repo_info.siblings),
+                                            "progress": progress_percent,
                                             "status": "DOWNLOADING"
                                         }
                                         
                                         # 异步发送WebSocket消息
                                         asyncio.run(broadcast_resource_update(progress_data))
-                                        logger.info(f"已发送文件下载进度: {idx+1}/{len(repo_info.siblings)}, 文件: {file_info.rfilename}")
+                                        logger.info(f"文件下载完成，已发送进度更新: {idx+1}/{len(repo_info.siblings)} ({progress_percent:.1f}%), 文件: {file_info.rfilename}")
+                                        
+                                        # 同时更新数据库中的进度（保持百分比格式）
+                                        _active_downloads[resource_id]["progress"] = progress_percent / 100.0
+                                        update_resource_status(
+                                            resource_id=resource_id,
+                                            status=DownloadStatus.DOWNLOADING,
+                                            progress=progress_percent
+                                        )
                                     except Exception as e:
                                         logger.error(f"发送下载进度失败: {str(e)}")
-                                    
-                                    logger.info(f"下载文件 ({idx+1}/{len(repo_info.siblings)}): {file_info.rfilename}")
-                                    hf_hub_download(
-                                        repo_id=resource.repo_id,
-                                        filename=file_info.rfilename,
-                                        repo_type="model",
-                                        local_dir=save_dir,
-                                        local_dir_use_symlinks=False,
-                                        resume_download=True,
-                                        endpoint=mirror_url
-                                    )
                                 
                                 logger.info(f"已完成所有文件的下载")
                             else:
@@ -651,7 +815,6 @@ def _download_worker(resource_id: int, resource: Resource, source: MirrorSource,
                                         repo_id=resource.repo_id,
                                         repo_type="model",
                                         local_dir=save_dir,
-                                        local_dir_use_symlinks=False,
                                         resume_download=True,
                                         endpoint=mirror_url,
                                         max_workers=4,
@@ -680,18 +843,22 @@ def _download_worker(resource_id: int, resource: Resource, source: MirrorSource,
             else:  # DATASET
                 # 获取数据集快照
                 try:
-                    # 首先尝试使用命令行方式下载
-                    logger.info(f"首先尝试使用命令行方式下载数据集 {resource.repo_id}")
-                    if download_with_cli(
-                        repo_id=resource.repo_id,
-                        repo_type="dataset",
-                        save_dir=save_dir,
-                        mirror_url=mirror_url
-                    ):
-                        logger.info("命令行下载成功")
+                    if use_cli_download:
+                        # 使用命令行方式下载（适用于官方站点或无法访问镜像站时）
+                        logger.info(f"使用命令行方式下载数据集 {resource.repo_id}")
+                        if download_with_cli(
+                            repo_id=resource.repo_id,
+                            repo_type="dataset",
+                            save_dir=save_dir,
+                            mirror_url=mirror_url
+                        ):
+                            logger.info("命令行下载成功")
+                        else:
+                            # 命令行下载失败，尝试使用API方式
+                            logger.warning("命令行下载失败，尝试API方式下载")
                     else:
-                        # 命令行下载失败，尝试使用API方式
-                        logger.warning("命令行下载失败，尝试API方式下载")
+                        # 直接使用API方式下载（适用于镜像站）
+                        logger.info(f"使用API方式下载数据集 {resource.repo_id}")
                         
                         # 使用huggingface_hub直接下载
                         logger.info(f"使用huggingface_hub {importlib.metadata.version('huggingface_hub')} 版本下载数据集")
@@ -717,10 +884,23 @@ def _download_worker(resource_id: int, resource: Resource, source: MirrorSource,
                                     if not os.path.exists(dir_path):
                                         os.makedirs(dir_path, exist_ok=True)
                                     
-                                    # 发送文件下载进度信息
+                                    logger.info(f"下载文件 ({idx+1}/{len(repo_info.siblings)}): {file_info.rfilename}")
+                                    hf_hub_download(
+                                        repo_id=resource.repo_id,
+                                        filename=file_info.rfilename,
+                                        repo_type="dataset",
+                                        local_dir=save_dir,
+                                        resume_download=True,
+                                        endpoint=mirror_url
+                                    )
+                                    
+                                    # 文件下载完成后发送进度更新
                                     try:
                                         from training_utils import broadcast_resource_update
                                         import asyncio
+                                        
+                                        # 计算实际进度百分比
+                                        progress_percent = ((idx + 1) / len(repo_info.siblings)) * 100
                                         
                                         progress_data = {
                                             "type": "resource_file_progress",
@@ -728,25 +908,23 @@ def _download_worker(resource_id: int, resource: Resource, source: MirrorSource,
                                             "file_name": file_info.rfilename,
                                             "file_index": idx + 1,
                                             "total_files": len(repo_info.siblings),
+                                            "progress": progress_percent,
                                             "status": "DOWNLOADING"
                                         }
                                         
                                         # 异步发送WebSocket消息
                                         asyncio.run(broadcast_resource_update(progress_data))
-                                        logger.info(f"已发送文件下载进度: {idx+1}/{len(repo_info.siblings)}, 文件: {file_info.rfilename}")
+                                        logger.info(f"文件下载完成，已发送进度更新: {idx+1}/{len(repo_info.siblings)} ({progress_percent:.1f}%), 文件: {file_info.rfilename}")
+                                        
+                                        # 同时更新数据库中的进度（保持百分比格式）
+                                        _active_downloads[resource_id]["progress"] = progress_percent / 100.0
+                                        update_resource_status(
+                                            resource_id=resource_id,
+                                            status=DownloadStatus.DOWNLOADING,
+                                            progress=progress_percent
+                                        )
                                     except Exception as e:
                                         logger.error(f"发送下载进度失败: {str(e)}")
-                                    
-                                    logger.info(f"下载文件 ({idx+1}/{len(repo_info.siblings)}): {file_info.rfilename}")
-                                    hf_hub_download(
-                                        repo_id=resource.repo_id,
-                                        filename=file_info.rfilename,
-                                        repo_type="dataset",
-                                        local_dir=save_dir,
-                                        local_dir_use_symlinks=False,
-                                        resume_download=True,
-                                        endpoint=mirror_url
-                                    )
                                 
                                 logger.info(f"已完成所有文件的下载")
                             else:
@@ -769,7 +947,6 @@ def _download_worker(resource_id: int, resource: Resource, source: MirrorSource,
                                         repo_id=resource.repo_id,
                                         repo_type="dataset",
                                         local_dir=save_dir,
-                                        local_dir_use_symlinks=False,
                                         resume_download=True,
                                         endpoint=mirror_url,
                                         max_workers=4,
@@ -807,6 +984,65 @@ def _download_worker(resource_id: int, resource: Resource, source: MirrorSource,
                 
         except Exception as download_error:
             logger.error(f"下载过程中出错: {str(download_error)}")
+            
+            # 尝试重新测试连通性并使用不同的端点重试
+            try:
+                logger.info("下载失败，尝试重新测试网络连通性...")
+                new_endpoint, new_is_mirror = retest_connectivity_and_adjust()
+                
+                # 如果端点发生了变化，尝试重新下载
+                if new_endpoint != mirror_url:
+                    logger.info(f"端点已切换从 {mirror_url} 到 {new_endpoint}，尝试重新下载")
+                    
+                    # 更新镜像URL
+                    mirror_url = new_endpoint
+                    use_cli_download = (source == MirrorSource.OFFICIAL) or (not new_is_mirror and source == MirrorSource.MIRROR_CN)
+                    
+                    logger.info(f"使用新的下载策略: {'CLI下载' if use_cli_download else 'API下载'}")
+                    
+                    # 重新尝试下载（简化版本，只尝试一次）
+                    if resource.resource_type == ResourceType.MODEL:
+                        if use_cli_download:
+                            download_with_cli(resource.repo_id, "model", save_dir, mirror_url)
+                        else:
+                            api = HfApi(endpoint=mirror_url)
+                            repo_info = api.model_info(repo_id=resource.repo_id)
+                            if hasattr(repo_info, 'siblings') and repo_info.siblings:
+                                for file_info in repo_info.siblings[:3]:  # 只下载前3个文件作为测试
+                                    if not file_info.rfilename.startswith('.'):
+                                        hf_hub_download(
+                                            repo_id=resource.repo_id,
+                                            filename=file_info.rfilename,
+                                            repo_type="model",
+                                            local_dir=save_dir,
+                                            resume_download=True,
+                                            endpoint=mirror_url
+                                        )
+                    else:  # DATASET
+                        if use_cli_download:
+                            download_with_cli(resource.repo_id, "dataset", save_dir, mirror_url)
+                        else:
+                            api = HfApi(endpoint=mirror_url)
+                            repo_info = api.dataset_info(repo_id=resource.repo_id)
+                            if hasattr(repo_info, 'siblings') and repo_info.siblings:
+                                for file_info in repo_info.siblings[:3]:  # 只下载前3个文件作为测试
+                                    if not file_info.rfilename.startswith('.'):
+                                        hf_hub_download(
+                                            repo_id=resource.repo_id,
+                                            filename=file_info.rfilename,
+                                            repo_type="dataset",
+                                            local_dir=save_dir,
+                                            resume_download=True,
+                                            endpoint=mirror_url
+                                        )
+                    
+                    logger.info("使用新端点重试下载成功")
+                else:
+                    logger.warning("端点未发生变化，无法通过切换端点解决问题")
+                    
+            except Exception as retry_error:
+                logger.error(f"重试下载也失败: {str(retry_error)}")
+            
             # 设置下载完成事件，停止进度检查线程
             download_completed.set()
             raise download_error
@@ -1032,10 +1268,10 @@ def print_huggingface_config():
         try:
             logger.info("测试镜像站连接...")
             import urllib.request
-            response = urllib.request.urlopen(mirror_url, timeout=5)
-            logger.info(f"连接到 {mirror_url} 成功，状态码: {response.getcode()}")
+            response = urllib.request.urlopen(best_endpoint, timeout=5)
+            logger.info(f"连接到 {best_endpoint} 成功，状态码: {response.getcode()}")
         except Exception as e:
-            logger.warning(f"连接到 {mirror_url} 失败: {str(e)}")
+            logger.warning(f"连接到 {best_endpoint} 失败: {str(e)}")
             
         logger.info("=========================================")
     except Exception as e:
@@ -1082,4 +1318,4 @@ def check_network_connectivity():
 check_network_connectivity()
 
 # 打印配置信息
-print_huggingface_config() 
+print_huggingface_config()

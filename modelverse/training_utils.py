@@ -877,7 +877,6 @@ async def download_resource(resource_id: int, source: str = "OFFICIAL"):
             snapshot_download(
                 repo_id=resource.repo_id,
                 local_dir=str(download_dir),
-                local_dir_use_symlinks=False,
                 resume_download=True,
                 progress_callback=progress_callback
             )
@@ -986,4 +985,4 @@ def clean_training_files(task_name: str, task_id: int = None):
         "success": len(errors) == 0,
         "cleaned_files": cleaned_files,
         "errors": errors
-    } 
+    }
